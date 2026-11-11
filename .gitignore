@@ -98,6 +98,7 @@ htmlcov/
 .ipynb_checkpoints/
 
 # IDE / OS
+.claude/
 .idea/
 .vscode/
 *.swp
