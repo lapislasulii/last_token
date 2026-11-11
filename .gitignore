@@ -1,0 +1,109 @@
+# ==== Хакатон: то, что нельзя пушить ====
+
+# Данные кейсодержателя (реальные кадры с камер кафе: NDA, люди в кадре)
+data/
+datasets/
+*.zip
+*.tar
+*.tar.gz
+*.7z
+*.rar
+*.jpg
+*.jpeg
+*.png
+*.bmp
+*.webp
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.parquet
+*.feather
+*.h5
+*.hdf5
+*.npy
+*.npz
+# Разрешить картинки для README/отчётов
+!docs/**/*.png
+!docs/**/*.jpg
+
+# Сабмиты и предсказания (не светить решение до конца соревнования)
+submissions/
+submission*.csv
+preds/
+predictions/
+oof/
+
+# Веса и чекпоинты моделей
+weights/
+checkpoints/
+models/
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.engine
+*.safetensors
+*.bin
+*.pkl
+*.joblib
+*.cbm
+runs/
+
+# Логи экспериментов
+wandb/
+mlruns/
+lightning_logs/
+tb_logs/
+outputs/
+logs/
+*.log
+
+# Секреты и креды (Kaggle API, токены)
+.env
+.env.*
+!.env.example
+kaggle.json
+.kaggle/
+*.pem
+*.key
+secrets/
+credentials*.json
+
+# Записи и материалы с открытия
+*.mp3
+*.wav
+*.m4a
+
+# ==== Базовое ====
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.python-version
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Кэши
+.cache/
+*.tmp
