@@ -47,6 +47,9 @@ models/
 *.bin
 *.pkl
 *.joblib
+# Selected small trained models explicitly published for the team
+!model_releases/temporal_core_c1.joblib
+!model_releases/temporal_core_c1_blend.joblib
 *.cbm
 runs/
 

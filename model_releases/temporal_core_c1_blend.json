@@ -1,0 +1,24 @@
+{
+  "name": "temporal_core_c1_blend",
+  "validation": {
+    "2026-10-25": 0.892035148722176,
+    "2026-10-26": 0.7883154468823258,
+    "mean": 0.840175297802251,
+    "worst": 0.7883154468823258,
+    "improves_both": true
+  },
+  "training_boxes": 198,
+  "python": "3.13.17",
+  "sklearn": "1.9.1",
+  "pandas": "3.1.0",
+  "numpy": "2.5.4",
+  "joblib": "1.6.0",
+  "sha256": "33b959f17dc32e2fb6357aa4457dce9ffbb4fae5025357c9779f5f9cffe1daf1",
+  "training_inputs_sha256": {
+    "train.csv": "db653129cace6686894c0c1f91da07b927f5db9472100a270bfd5dab293394ba",
+    "train_frames.csv": "3adbd55bd6f4d54f483f2d9e92a21901707774800a8cf1e44a48f02c26f9b7f5",
+    "train_context.csv": "58b7a0ee875b20d96127b5cbd049f3a962fb87d9d239c525f7be3f154b50769d",
+    "train_stream_predictions.csv": "5b75bc2e22d00531e8e48a36da94ec3607b74a040125da43a0d5a26a469205d1",
+    "scoring_policy.json": "64f4882bf11ffe3d62089b5ff60d05ae7e289a5c05ac1198c1d5eba2b4c6d3d8"
+  }
+}
