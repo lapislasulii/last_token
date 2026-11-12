@@ -150,3 +150,16 @@ python tools/view_frame.py --split train --frame FRAME_ID --output reports/frame
 git clone https://github.com/lapislasulii/last_token.git
 cd last_token
 ```
+
+## Обучение логистической регрессии
+
+```bash
+python -m pip install pandas numpy scikit-learn joblib
+python tools/train_logreg.py
+```
+
+Скрипт проверяет три варианта: confidence; confidence + класс; confidence + класс + геометрия. Регуляризация фиксирована (`C=1`), масштабирование и кодирование класса обучаются отдельно внутри каждого разбиения по UTC-дням. Метрики и версии библиотек — в [reports/logreg_results.md](reports/logreg_results.md).
+
+Первый эксперимент: средний AP baseline **0,812772**, регрессии с классом **0,774441**, с геометрией **0,778973**. Регрессия только на confidence сохраняет ранжирование baseline. Добавленные признаки ухудшили оба дня; улучшение пока не получено. Результаты не являются оценкой Kaggle.
+
+Локально сохраняются `oof/logreg_*.csv` (честные предсказания на отложенных днях), `models/logreg_*.joblib` (модели, переобученные на всех 198 примерах) и `submissions/logreg_*.csv` (362 ответа на test). Эти файлы исключены из Git. Сабмиты автоматически на Kaggle не отправляются.
