@@ -1,0 +1,217 @@
+"""Browse local detector predictions and human annotations.
+
+python tools/view_frame.py                    # local browser viewer
+python tools/view_frame.py --split train --frame FRAME_ID --output reports/frame.png
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import mimetypes
+import threading
+import webbrowser
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
+
+import pandas as pd
+from PIL import Image, ImageDraw, ImageFont
+
+ROOT = Path(__file__).resolve().parents[1]
+COLORS = {"correct": "#16a34a", "error": "#dc2626", "unknown": "#ca8a04", "human": "#2563eb"}
+
+
+class Dataset:
+    def __init__(self, folder: Path):
+        self.folder = folder.resolve()
+        policy = json.loads((folder / "scoring_policy.json").read_text(encoding="utf-8"))
+        aliases = policy.get("aliases", {})
+        self.excluded = set(policy.get("test_excluded_classes", []))
+        self.frames = {}
+        self.predictions = {}
+        self.context = {}
+        self.frame_lists = {}
+        self.preferred_frames = {}
+        for split in ("train", "test", "machine"):
+            frames = pd.read_csv(folder / f"{split}_frames.csv", dtype={"frame_id": str})
+            frames = frames.sort_values(["timestamp", "frame_id"])
+            self.frame_lists[split] = frames.frame_id.tolist()
+            self.frames[split] = frames.set_index("frame_id").to_dict("index")
+            name = "machine_predictions.csv" if split == "machine" else f"{split}_stream_predictions.csv"
+            predictions = pd.read_csv(folder / name, dtype={"detection_id": str, "frame_id": str})
+            predictions["class_name"] = predictions.class_name.replace(aliases)
+            if split == "train":
+                labels = pd.read_csv(folder / "train.csv", dtype={"id": str, "frame_id": str})
+                if not labels.id.is_unique:
+                    raise ValueError("Duplicate IDs in train.csv")
+                # Only existing official labels, never inferred from confidence or IoU.
+                predictions = predictions.merge(labels[["id", "error"]], left_on="detection_id", right_on="id", how="left", validate="one_to_one")
+            self.predictions[split] = {key: group for key, group in predictions.groupby("frame_id")}
+            candidates = predictions[~predictions.class_name.isin(self.excluded)]
+            if split == "train":
+                candidates = candidates[candidates.error.notna()]
+                counts = candidates.groupby("frame_id").error.sum()
+            else:
+                counts = candidates.groupby("frame_id").size()
+            self.preferred_frames[split] = counts.idxmax() if not counts.empty else self.frame_lists[split][0]
+            if split != "machine":
+                ctx = pd.read_csv(folder / f"{split}_context.csv").fillna("")
+                self.context[split] = ctx.set_index("frame_id").to_dict("index")
+        human = pd.read_csv(folder / "human_boxes_train.csv")
+        human["class_name"] = human.class_name.replace(aliases)
+        self.human = {key: group for key, group in human.groupby("frame_id")}
+
+    def image_path(self, split, frame_id):
+        row = self.frames[split][frame_id]
+        path = (self.folder / row["image_path"]).resolve()
+        if not path.is_relative_to(self.folder):
+            raise ValueError("Image path outside dataset")
+        return path
+
+    def payload(self, split, frame_id):
+        row = self.frames[split][frame_id]
+        with Image.open(self.image_path(split, frame_id)) as image:
+            width, height = image.size
+        # Machine-pool coordinates refer to the original 1280 x 720 canvas.
+        coordinate_width = 1280 if split == "machine" else float(row["image_width"])
+        coordinate_height = 720 if split == "machine" else float(row["image_height"])
+        sx, sy = width / coordinate_width, height / coordinate_height
+        boxes = []
+        predictions = self.predictions[split].get(frame_id)
+        if predictions is not None:
+            for r in predictions.to_dict("records"):
+                error = r.get("error")
+                status = "unknown" if error is None or pd.isna(error) else ("error" if int(error) else "correct")
+                boxes.append({"kind": "machine", "class_name": r["class_name"], "id": str(r["detection_id"]), "confidence": float(r["confidence"]), "status": status, "excluded": r["class_name"] in self.excluded,
+                              "xyxy": [float(r["x1"]) * sx, float(r["y1"]) * sy, float(r["x2"]) * sx, float(r["y2"]) * sy]})
+        humans = self.human.get(frame_id) if split == "train" else None
+        if humans is not None:
+            for r in humans.to_dict("records"):
+                boxes.append({"kind": "human", "class_name": r["class_name"], "status": "human", "source": r.get("source", ""), "excluded": r["class_name"] in self.excluded,
+                              "xyxy": [(float(r["cx"]) - float(r["w"])/2)*width, (float(r["cy"]) - float(r["h"])/2)*height, (float(r["cx"]) + float(r["w"])/2)*width, (float(r["cy"]) + float(r["h"])/2)*height]})
+        ctx = self.context.get(split, {}).get(frame_id)
+        if ctx is None and split == "machine":
+            # Nearest available pool frames; actual timestamps are shown, no 30s assumption.
+            keys = self.frame_lists[split]
+            i = keys.index(frame_id)
+            ctx = {"previous": keys[i-1] if i else "", "next": keys[i+1] if i+1 < len(keys) else ""}
+        return {"frame_id": frame_id, "split": split, "timestamp": str(row["timestamp"]), "width": width, "height": height, "boxes": boxes, "context": ctx or {}, "has_human": humans is not None, "is_target": frame_id in self.context.get(split, {})}
+
+
+def box_label(box):
+    if box["kind"] == "human":
+        return f"GT {box['class_name']} ({box['source']})"
+    error = {"correct": "0", "error": "1", "unknown": "?"}[box["status"]]
+    suffix = " [not scored]" if box["excluded"] else ""
+    return f"{box['class_name']} conf={box['confidence']:.2f} error={error}{suffix}"
+
+
+def export_image(dataset, split, frame_id, output, humans=True, machines=True, tables=False):
+    data = dataset.payload(split, frame_id)
+    with Image.open(dataset.image_path(split, frame_id)) as source:
+        image = source.convert("RGB")
+    draw = ImageDraw.Draw(image)
+    font = ImageFont.load_default(size=14)
+    for box in sorted(data["boxes"], key=lambda b: b["kind"] != "human"):
+        if (box["excluded"] and not tables) or (box["kind"] == "human" and not humans) or (box["kind"] == "machine" and not machines):
+            continue
+        color = COLORS[box["status"]]
+        coords = box["xyxy"]
+        draw.rectangle(coords, outline=color, width=2 if box["kind"] == "human" else 3)
+        label = box_label(box)
+        bounds = draw.textbbox((0, 0), label, font=font)
+        x = max(0, min(coords[0], image.width - bounds[2]))
+        y = max(0, coords[1] - (18 if box["kind"] == "human" else 36))
+        draw.rectangle((x, y, x+bounds[2], y+18), fill="#111827")
+        draw.text((x, y), label, font=font, fill=color)
+    banner = Image.new("RGB", (image.width, image.height + 65), "#111827")
+    banner.paste(image, (0, 65))
+    d = ImageDraw.Draw(banner)
+    d.text((8, 4), f"{split}: {frame_id}", font=font, fill="white")
+    d.text((8, 25), "GT=blue | error=0 green | error=1 red | error=? yellow | table not scored", font=font, fill="white")
+    d.text((8, 45), data["timestamp"], font=font, fill="white")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    banner.save(output)
+    print(f"Saved: {output.resolve()}")
+
+
+def serve(dataset, split, frame_id, port, open_browser):
+    page = Path(__file__).with_name("frame_viewer.html").read_bytes()
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            url = urlsplit(self.path)
+            params = parse_qs(url.query)
+            try:
+                if url.path == "/":
+                    body, content_type = page, "text/html; charset=utf-8"
+                elif url.path == "/api/frames":
+                    body = json.dumps({"frames": dataset.frame_lists, "preferred_frames": dataset.preferred_frames, "initial_split": split, "initial_frame": frame_id}).encode()
+                    content_type = "application/json"
+                elif url.path in ("/api/frame", "/image"):
+                    s, f = params["split"][0], params["frame"][0]
+                    if url.path == "/api/frame":
+                        body = json.dumps(dataset.payload(s, f), allow_nan=False).encode()
+                        content_type = "application/json"
+                    else:
+                        path = dataset.image_path(s, f)
+                        body, content_type = path.read_bytes(), mimetypes.guess_type(path)[0] or "image/jpeg"
+                else:
+                    self.send_error(404)
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.end_headers()
+                self.wfile.write(body)
+            except (KeyError, ValueError, FileNotFoundError) as exc:
+                self.send_error(404, str(exc))
+
+        def log_message(self, *_):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    url = f"http://127.0.0.1:{server.server_address[1]}"
+    print(f"Viewer: {url} (Ctrl+C to stop)", flush=True)
+    if open_browser:
+        threading.Timer(0.5, lambda: webbrowser.open(url)).start()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--data", type=Path, default=ROOT / "data/rascar-hack-case-1")
+    parser.add_argument("--split", choices=["train", "test", "machine"], default="train")
+    parser.add_argument("--frame", help="Frame ID, or image filename with .jpg")
+    parser.add_argument("--output", type=Path, help="Save annotated PNG/JPEG instead of starting viewer")
+    parser.add_argument("--no-human", action="store_true")
+    parser.add_argument("--no-machine", action="store_true")
+    parser.add_argument("--tables", action="store_true", help="Include table boxes in exported image")
+    parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--no-browser", action="store_true")
+    args = parser.parse_args()
+    try:
+        dataset = Dataset(args.data)
+        frame_id = Path(args.frame).stem if args.frame else None
+        if frame_id is None:
+            # Start on an informative labeled frame rather than an empty night scene.
+            frame_id = dataset.preferred_frames[args.split]
+        if frame_id not in dataset.frames[args.split]:
+            parser.error(f"Unknown frame in {args.split}: {frame_id}")
+        if args.output:
+            export_image(dataset, args.split, frame_id, args.output, not args.no_human, not args.no_machine, args.tables)
+        else:
+            serve(dataset, args.split, frame_id, args.port, not args.no_browser)
+    except (OSError, ValueError, KeyError) as exc:
+        parser.exit(1, f"Error: {exc}\n")
+
+
+if __name__ == "__main__":
+    main()
