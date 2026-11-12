@@ -113,3 +113,12 @@ Thumbs.db
 # Кэши
 .cache/
 *.tmp
+
+# Selected marked-context heads for team reproduction
+!model_releases/marked_context_l1.joblib
+!model_releases/marked_context_base_l1.joblib
+!model_releases/marked_context_large_l1.joblib
+!model_releases/marked_context_clip_l1.joblib
+
+# Local notebook containing credentials
+Untitled.ipynb

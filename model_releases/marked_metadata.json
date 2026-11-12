@@ -1,0 +1,18 @@
+{
+  "marked_context_l1": {
+    "sha256": "42dee7fe9ab900a9f3303dc6d1f85917bac719c7d9b491d2c92a066b1b5def6c",
+    "bytes": 37215
+  },
+  "marked_context_base_l1": {
+    "sha256": "80af8e8aad1bd62976dc7333ebc0b849472d2ad524f67b1f9b7ee4feee436282",
+    "bytes": 72542
+  },
+  "marked_context_large_l1": {
+    "sha256": "f93377e20a19aa568740f6ed4dfe08617ea5be6203e433213dc5c065bc8c46a1",
+    "bytes": 96095
+  },
+  "marked_context_clip_l1": {
+    "sha256": "5316956136f3237d4158bc70795c4fbb8c1f910543b6563f076aa3e0fc028ad4",
+    "bytes": 96208
+  }
+}
