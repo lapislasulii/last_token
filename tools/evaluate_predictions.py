@@ -143,9 +143,9 @@ def validate_prediction_file(path: Path, expected_ids: pd.Series) -> tuple[pd.Se
 
 
 def average_precision(y: np.ndarray, score: np.ndarray) -> float | None:
-    """None означает, что AP неинформативен: в группе нет положительных или нет отрицательных."""
+    """Официальный sklearn AP для непустой группы; None только для пустой."""
     y = np.asarray(y, dtype=int)
-    if len(y) == 0 or y.sum() == 0 or y.sum() == len(y):
+    if len(y) == 0:
         return None
     return float(average_precision_score(y, score))
 
@@ -187,7 +187,7 @@ def evaluate(df: pd.DataFrame, scores: pd.Series) -> dict:
             "n_boxes": int(len(group)),
             "n_errors": int(y.sum()),
             "ap": ap_value,
-            "ap_status": "ok" if ap_value is not None else "неинформативен: нет положительных или нет отрицательных примеров",
+            "ap_status": "ok" if 0 < y.sum() < len(y) else "неинформативен: нет положительных или нет отрицательных примеров",
             "baseline_ap": baseline_ap,
         })
 
@@ -352,8 +352,37 @@ def selftest() -> None:
 
     tied = pd.Series([0.5, 0.5, 0.5, 0.5], index=ids)
     tied_result = evaluate(frame, tied)
-    assert tied_result["summary"]["mean_ap"] is not None
+    assert np.isclose(tied_result["summary"]["mean_ap"], y.mean())
     print("OK: tied scores обрабатываются")
+
+    # A single-class day must remain in the official average, while class
+    # diagnostics can still explain that there is no ranking discrimination.
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        assert average_precision(np.array([]), np.array([])) is None
+        for label in (0, 1):
+            labels = np.full(4, label)
+            expected = average_precision_score(labels, scores.to_numpy())
+            assert average_precision(labels, scores.to_numpy()) == expected
+            single = frame.assign(error=labels)
+            single_result = evaluate(single, scores)
+            assert single_result["per_day"][0]["ap"] == expected
+            assert single_result["summary"]["mean_ap"] == expected
+            assert single_result["per_class"][0]["ap"] == expected
+            assert single_result["per_class"][0]["ap_status"].startswith("неинформативен")
+            second = single.assign(id=single.id + "_next", day="2026-10-26")
+            combined = pd.concat([frame, second], ignore_index=True)
+            combined_scores = pd.concat([scores, pd.Series(scores.to_numpy(), index=second.id)])
+            result = evaluate(combined, combined_scores)
+            expected_mean = (original["summary"]["mean_ap"] + expected) / 2
+            assert np.isclose(result["summary"]["mean_ap"], expected_mean)
+            assert np.isclose(result["summary"]["mean_baseline_ap"],
+                              (original["summary"]["mean_baseline_ap"] + expected) / 2)
+            assert result["summary"]["worst_day_ap"] == min(original["summary"]["mean_ap"], expected)
+            assert np.isclose(result["summary"]["mean_delta_vs_baseline"],
+                              original["summary"]["mean_delta_vs_baseline"] / 2)
+    print("OK: дни с одними 0 или 1 учитываются в AP и среднем; диагностический статус сохранён")
 
     with tempfile.TemporaryDirectory() as tmp:
         p = Path(tmp) / "pred.csv"
