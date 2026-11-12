@@ -1,0 +1,23 @@
+{
+  "encoder": {
+    "model": "facebook/dinov2-small",
+    "revision": "ed25f3a31f01632728cabb09d1542f84ab7b0056",
+    "url": "https://huggingface.co/facebook/dinov2-small/tree/ed25f3a31f01632728cabb09d1542f84ab7b0056",
+    "fingerprint": "2640a149908da06533ccb286ed7fc424f05343460f0cd5ce9d37b86ed62b22de",
+    "preprocessing": "clipped crop, box or 1.5x context; aspect preserving bicubic pad 224, RGB fill124/116/104; ImageNet normalization; CLS384",
+    "torch": "2.11.0+cu128"
+  },
+  "models": {
+    "visual_residual_box_l10": {
+      "sha256": "0007bcbfac4396cfa02bd59a4804dddfef02bb6e9602d539786513fd328b6520",
+      "bytes": 37495,
+      "public_ap": "0.64967"
+    },
+    "visual_residual_context_l1": {
+      "sha256": "82f398e8176bfd5ac1e58a0d8a097a3476d64dc916f3daee5e447b0f68543e20",
+      "bytes": 37499,
+      "public_ap": "0.65944"
+    }
+  },
+  "validation": "Two UTC-day folds; final heads fit all 198 non-table rows."
+}

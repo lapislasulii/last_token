@@ -50,6 +50,8 @@ models/
 # Selected small trained models explicitly published for the team
 !model_releases/temporal_core_c1.joblib
 !model_releases/temporal_core_c1_blend.joblib
+!model_releases/visual_residual_box_l10.joblib
+!model_releases/visual_residual_context_l1.joblib
 *.cbm
 runs/
 
