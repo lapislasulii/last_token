@@ -40,6 +40,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from scipy.optimize import linear_sum_assignment
 from sklearn.metrics import average_precision_score
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -285,8 +286,20 @@ def iou_matrix(a, b):
     return inter / (area(a)[:, None] + area(b)[None, :] - inter + 1e-9)
 
 
+def one_to_one(m, same):
+    """Официальное правило метки: взаимно однозначные пары одного класса с IoU >= 0.6,
+    сначала максимум числа пар, затем максимум суммарного IoU. Возвращает флаг «бокс получил пару»."""
+    matched = np.zeros(m.shape[0], dtype=bool)
+    if m.size:
+        w = np.where(same & (m >= 0.6), 1000.0 + m, 0.0)
+        rows, cols = linear_sum_assignment(w, maximize=True)
+        matched[rows[w[rows, cols] > 0]] = True
+    return matched
+
+
 def agreement_features(boxes, ours, min_conf=0.05):
-    """Для каждого исходного бокса — насколько с ним согласен наш детектор."""
+    """Для каждого исходного бокса — насколько с ним согласен наш детектор.
+    boxes должны содержать все боксы кадра оцениваемых классов: дубли делят одну пару."""
     ours = ours[ours.confidence >= min_conf]
     feats = []
     xy = ["x1", "y1", "x2", "y2"]
@@ -295,6 +308,7 @@ def agreement_features(boxes, ours, min_conf=0.05):
         m = iou_matrix(g[xy].to_numpy(), o[xy].to_numpy())
         same = g.class_name.to_numpy()[:, None] == o.class_name.to_numpy()[None, :]
         oc = o.confidence.to_numpy()
+        matched = one_to_one(m, same)
         for i, r in enumerate(g.itertuples()):
             ms = np.where(same[i], m[i], 0.0) if len(o) else np.zeros(0)
             mo = np.where(~same[i], m[i], 0.0) if len(o) else np.zeros(0)
@@ -308,6 +322,7 @@ def agreement_features(boxes, ours, min_conf=0.05):
                 iou_other=mo.max() if mo.size else 0.0,                         # совпадение с нашим боксом ДРУГОГО класса
                 other_conf=oc[int(mo.argmax())] if mo.size and mo.max() > 0 else 0.0,
                 n_same_03=int((ms >= 0.3).sum()) if ms.size else 0,             # сколько наших боксов рядом
+                matched=bool(matched[i]),                                        # пара по правилу один к одному
             ))
     return pd.DataFrame(feats)
 
@@ -332,10 +347,10 @@ def oof_features(train_df, member):
 
 
 def ensemble(frames):
-    """Свести таблицы участников: D — доля участников без пары IoU>=0.6, iou_same — средний."""
+    """Свести таблицы участников: D — доля участников без пары (один к одному), iou_same — средний."""
     df = frames[0].copy()
     assert all((f.id.values == df.id.values).all() for f in frames)
-    df["D"] = np.mean([(f.iou_same < 0.6).to_numpy() for f in frames], axis=0)
+    df["D"] = np.mean([~f.matched.to_numpy() for f in frames], axis=0)
     df["iou_same"] = np.mean([f.iou_same.to_numpy() for f in frames], axis=0)
     return df[[c for c in df.columns if c not in ("conf_at_best", "match_conf", "iou_other", "other_conf", "n_same_03")]]
 
@@ -361,7 +376,7 @@ def evaluate_ensemble(train_df, members):
         aps = [average_precision_score(df.error[df.day == d], s[df.day == d]) for d in DAYS]
         print(f"{name:34s} AP {aps[0]:.4f} {aps[1]:.4f} среднее {np.mean(aps):.4f}")
     print("Распределение D:", df.D.round(2).value_counts().sort_index().to_dict())
-    flips = np.mean([(f.iou_same < 0.6).to_numpy() for f in frames], axis=0)
+    flips = np.mean([~f.matched.to_numpy() for f in frames], axis=0)
     print(f"Боксов, по которым участники расходятся: {int(((flips > 0) & (flips < 1)).sum())} из {len(df)}")
     oof = ROOT / "oof" / f"{WORK.name}{suffix}_veto.csv"
     oof.parent.mkdir(exist_ok=True)
@@ -388,7 +403,7 @@ def evaluate(args):
         "1 - iou_same*conf_at_best": 1 - df.iou_same * df.conf_at_best,
         "rank-avg(base, 1-match_conf)": (rank01(base) + rank01(1 - agree)) / 2,
         "rank-avg(base, 1-iou_same)": (rank01(base) + rank01(1 - df.iou_same)) / 2,
-        "veto: (base + [iou_same<0.6]) / 2": primary_score(df),
+        "veto: (base + [нет пары 1:1]) / 2": primary_score(df),
         "veto, только person": (base + ((df.iou_same < 0.6) & (df.class_name == "person"))) / 2,
     }
     rows = []
@@ -412,7 +427,7 @@ def evaluate(args):
 
 def primary_score(df):
     """Заранее выбранный вариант: бокс без пары IoU>=0.6 у нашего детектора поднимается над остальными."""
-    disagree = df.D if "D" in df else (df.iou_same < 0.6)
+    disagree = df.D if "D" in df else ~df.matched
     return ((1 - df.confidence) + disagree) / 2
 
 
@@ -431,7 +446,7 @@ def submit(args):
     path.parent.mkdir(exist_ok=True)
     template[["id"]].merge(df[["id"]].assign(score=primary_score(df)), on="id", validate="one_to_one").to_csv(path, index=False)
     print("Доля боксов без пары по классам:")
-    print((df.D if many else (df.iou_same < 0.6)).groupby(df.class_name).mean().round(2).to_string())
+    print((df.D if many else ~df.matched).groupby(df.class_name).mean().round(2).to_string())
     print("Файл:", path)
 
 
