@@ -23,6 +23,14 @@
 Это голосование, координаты боксов не усредняются. Состав ансамбля входит в имена файлов результата.
 --extra-classes добавляет в обучение столы и «отвлекающие» ручные классы (телефоны, тарелки, вещи):
 детектор учится отличать их от чашек и кистей; в согласии участвуют только оцениваемые классы.
+
+Self-training на machine pool (ученик учится на ручных боксах + псевдоразметке учителя):
+  pseudo  --tag strong --extra-classes --teacher base --pool-frames 1500 --device 0
+          учитель day_X (обучен только на ручных боксах дня X) размечает кадры пула ТОЛЬКО за день X;
+          учитель all размечает пул за оба дня. Получаются наборы yolo/student_<набор>.
+  train   --tag strong --extra-classes --student --member st --weights weights/yolo11l.pt --epochs 60 ...
+  predict / eval / submit — как обычно, с --member st (или в ансамбле: --members base st).
+Честность по дням: в fold «проверка на 26.10» ни учитель, ни пул, ни ученик не видят 26.10.
 """
 import argparse
 import json
@@ -123,9 +131,102 @@ def train(args):
             YOLO(checkpoint).train(resume=True, device=args.device)
             continue
         model = YOLO(args.weights)  # публичные COCO-веса Ultralytics, скачиваются автоматически
-        model.train(data=str(WORK / "yolo" / name / "data.yaml"), epochs=args.epochs, imgsz=args.imgsz,
+        data_dir = WORK / "yolo" / (f"student_{name}" if args.student else name)
+        if not (data_dir / "data.yaml").is_file():
+            raise FileNotFoundError(f"{data_dir / 'data.yaml'}: сначала build" + (" и pseudo" if args.student else ""))
+        model.train(data=str(data_dir / "data.yaml"), epochs=args.epochs, imgsz=args.imgsz,
                     batch=args.batch, device=args.device, project=str(WORK / "runs"),
                     name=run_name(name, args.member), exist_ok=True, seed=args.seed, deterministic=True, val=False, patience=0, plots=False, flipud=0.0, verbose=False, workers=2)
+
+
+# ---------------------------------------------------------------- pseudo (self-training)
+POOL_DAYS = {"day_20261025": ["20261025"], "day_20261026": ["20261026"], "all": DAYS}
+
+
+def link(src, dst):
+    if dst.exists() or dst.is_symlink():
+        return
+    try:
+        os.symlink(src, dst)
+    except OSError:  # Windows без Developer Mode
+        shutil.copy2(src, dst)
+
+
+def pseudo(args):
+    """Учитель размечает кадры пула своего дня; собирается набор ученика: ручные кадры (с повтором) + псевдокадры."""
+    from ultralytics import YOLO
+    pool = pd.read_csv(DATA / "machine_frames.csv")
+    pool["day"] = pd.to_datetime(pool.timestamp, utc=True, format="mixed").dt.strftime("%Y%m%d")
+    pool = pool[pool.image_exists.astype(bool)]
+    mp = load("machine_predictions.csv")
+    with_people = set(mp[(mp.class_name == "person") & (mp.confidence >= 0.5)].frame_id)
+    for name in args.sets:
+        teacher_path = WORK / "runs" / run_name(name, args.teacher) / "weights" / "last.pt"
+        if not teacher_path.is_file():
+            raise FileNotFoundError(f"нет учителя {teacher_path}: сначала train для {name}")
+        teacher = YOLO(teacher_path)
+        unknown = set(teacher.names.values()) - set(TRAIN_CLASSES)
+        if unknown:
+            raise ValueError(f"классы учителя {sorted(unknown)} не входят в TRAIN_CLASSES: проверь --extra-classes")
+        # Кадры только разрешённого дня; в основном сцены с людьми (там главный резерв), 20% — любые.
+        cand = pool[pool.day.isin(POOL_DAYS[name])]
+        people = cand[cand.frame_id.isin(with_people)]
+        rest = cand[~cand.frame_id.isin(with_people)]
+        n_people = min(len(people), int(args.pool_frames * 0.8))
+        n_rest = min(len(rest), args.pool_frames - n_people)
+        chosen = pd.concat([people.sample(n_people, random_state=args.seed),
+                            rest.sample(n_rest, random_state=args.seed)]).sort_values("timestamp")
+        print(f"{name}: пул дней {POOL_DAYS[name]}, кадров с людьми {len(people)}, выбрано {len(chosen)}", flush=True)
+
+        root = WORK / "yolo" / f"student_{name}"
+        if root.exists():
+            shutil.rmtree(root)  # набор ученика пересобирается целиком, без хвостов прошлых запусков
+        for sub in ("images", "labels"):
+            (root / sub).mkdir(parents=True)
+        # 1) настоящие ручные кадры, повторённые --real-repeat раз, чтобы псевдоразметка их не задавила
+        real = WORK / "yolo" / name
+        if not (real / "labels").is_dir():
+            raise FileNotFoundError(f"{real}: сначала build")
+        n_real = 0
+        for lbl in sorted((real / "labels").glob("*.txt")):
+            for k in range(args.real_repeat):
+                stem = f"{lbl.stem}__r{k}"
+                link((real / "images" / f"{lbl.stem}.jpg").resolve(), root / "images" / f"{stem}.jpg")
+                shutil.copy2(lbl, root / "labels" / f"{stem}.txt")
+                n_real += 1
+        # 2) псевдоразметка пула
+        rows, kept, skipped = [], 0, 0
+        paths = [str(DATA / p) for p in chosen.image_path]
+        for start in range(0, len(paths), args.predict_batch):
+            batch = chosen.iloc[start:start + args.predict_batch]
+            results = teacher.predict(paths[start:start + args.predict_batch], imgsz=args.imgsz, conf=args.pseudo_low,
+                                      iou=0.6, device=args.device, stream=True, verbose=False, max_det=200)
+            for fid, res in zip(batch.frame_id, results):
+                b = res.boxes
+                conf = b.conf.cpu().numpy()
+                names = [teacher.names[int(k)] for k in b.cls.cpu().numpy()]
+                xywhn = b.xywhn.cpu().numpy()
+                for c, n, box in zip(conf, names, b.xyxy.cpu().numpy() * (1280 / res.orig_shape[1])):
+                    rows.append((fid, n, float(c), *map(float, box)))
+                # кадр с неуверенным person пропускаем целиком: неизвестно, человек это или фон, и любое
+                # решение учило бы ученика ошибке учителя. Неуверенные мелкие классы просто не попадают в метки
+                # (иначе отсеялись бы почти все людные сцены — там всегда есть сомнительная рука).
+                ambiguous = any(n == "person" and c < args.pseudo_conf for c, n in zip(conf, names))
+                if ambiguous:
+                    skipped += 1
+                    continue
+                keep = [(n, box) for c, n, box in zip(conf, names, xywhn) if c >= args.pseudo_conf]
+                link((DATA / f"{fid}.jpg").resolve(), root / "images" / f"{fid}.jpg")
+                (root / "labels" / f"{fid}.txt").write_text("".join(
+                    f"{TRAIN_CLASSES.index(n)} {x:.6f} {y:.6f} {w:.6f} {h:.6f}\n" for n, (x, y, w, h) in keep))
+                kept += 1
+            print(f"{name}: {min(start + args.predict_batch, len(paths))}/{len(paths)} кадров пула", flush=True)
+        (root / "data.yaml").write_text(
+            f"path: {root}\ntrain: images\nval: images\nnames:\n" + "".join(f"  {i}: {c}\n" for i, c in enumerate(TRAIN_CLASSES)))
+        pd.DataFrame(rows, columns=["frame_id", "class_name", "confidence", "x1", "y1", "x2", "y2"]).to_csv(
+            WORK / f"pseudo_{name}_{args.teacher}.csv", index=False)
+        print(f"{name}: ручных кадров {n_real} (x{args.real_repeat}), псевдокадров {kept}, "
+              f"пропущено неоднозначных {skipped}; набор {root}")
 
 
 # ---------------------------------------------------------------- predict
@@ -322,7 +423,14 @@ def submit(args):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["build", "train", "predict", "eval", "submit"])
+    ap.add_argument("cmd", choices=["build", "train", "pseudo", "predict", "eval", "submit"])
+    ap.add_argument("--student", action="store_true", help="train: учить на наборе student_<набор> (после pseudo)")
+    ap.add_argument("--teacher", default="base", help="pseudo: участник-учитель")
+    ap.add_argument("--pool-frames", type=int, default=1500, help="pseudo: сколько кадров пула на набор")
+    ap.add_argument("--pseudo-conf", type=float, default=0.5, help="pseudo: порог уверенности псевдобокса")
+    ap.add_argument("--pseudo-low", type=float, default=0.25,
+                    help="pseudo: боксы оцениваемых классов в [low, conf) делают кадр неоднозначным -> пропуск")
+    ap.add_argument("--real-repeat", type=int, default=5, help="pseudo: во сколько раз повторить ручные кадры")
     ap.add_argument("--sets", nargs="+", default=["day_20261025", "day_20261026"])
     ap.add_argument("--weights", default="yolo11s.pt")
     ap.add_argument("--resume", action="store_true", help="продолжить выбранные наборы с сохранённого last.pt")
@@ -342,5 +450,5 @@ if __name__ == "__main__":
     if a.extra_classes:
         TRAIN_CLASSES = CLASSES + EXTRA
     WORK.mkdir(parents=True, exist_ok=True)
-    {"build": lambda: build(), "train": lambda: train(a), "predict": lambda: predict(a), "eval": lambda: evaluate(a),
-     "submit": lambda: submit(a)}[a.cmd]()
+    {"build": lambda: build(), "train": lambda: train(a), "pseudo": lambda: pseudo(a), "predict": lambda: predict(a),
+     "eval": lambda: evaluate(a), "submit": lambda: submit(a)}[a.cmd]()
