@@ -22,8 +22,12 @@ COLORS = {"correct": "#22c55e", "error": "#ef4444", "unknown": "#eab308", "human
 
 
 class Dataset:
-    def __init__(self, folder: Path, scores: dict | None = None):
+    def __init__(self, folder: Path, scores: dict | None = None, test_detections: Path | None = None):
         self.folder = folder.resolve()
+        self.test_detections = {}
+        if test_detections:
+            detections = pd.read_csv(test_detections)
+            self.test_detections = dict(tuple(detections.groupby('frame_id')))
         self.scores = {}       # split -> {id: (score, место в очереди, размер очереди)}
         self.worst = {}        # split -> кадры, отсортированные по числу промахов модели
         self.score_files = {}
@@ -110,6 +114,12 @@ class Dataset:
                 if scored:
                     box["score"], box["rank"], box["queue"] = scored
                 boxes.append(box)
+        if split == 'test' and frame_id in self.test_detections:
+            for r in self.test_detections[frame_id].itertuples():
+                boxes.append(dict(kind='redetect', class_name=r.class_name,
+                                  confidence=float(r.confidence), status='unknown',
+                                  excluded=r.class_name in self.excluded, source='YOLO11l base',
+                                  xyxy=[float(r.x1)*sx, float(r.y1)*sy, float(r.x2)*sx, float(r.y2)*sy]))
         humans = self.human.get(frame_id) if split == "train" else None
         if humans is not None:
             for r in humans.to_dict("records"):
@@ -229,12 +239,13 @@ def main():
     parser.add_argument("--other", action="store_true", help="Also show unscored human classes (hair, uniform, phone…)")
     parser.add_argument("--scores", type=Path, help="OOF score модели для train (id,score), например oof/redetect_strong_veto_veto.csv")
     parser.add_argument("--test-scores", type=Path, help="Сабмит для test (id,score)")
+    parser.add_argument("--test-detections", type=Path, help="Боксы нашего детектора на test: pred_all.csv")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--no-browser", action="store_true")
     args = parser.parse_args()
     try:
         scores = {k: v for k, v in (("train", args.scores), ("test", args.test_scores)) if v}
-        dataset = Dataset(args.data, scores)
+        dataset = Dataset(args.data, scores, args.test_detections)
         frame_id = Path(args.frame).stem if args.frame else None
         if frame_id is None:
             # Start on an informative labeled frame rather than an empty night scene.
