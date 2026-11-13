@@ -124,3 +124,5 @@ Thumbs.db
 Untitled.ipynb
 
 !model_releases/clip_inside_outside.joblib
+
+!model_releases/synthetic_seed43.joblib

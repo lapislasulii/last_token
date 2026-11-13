@@ -1,0 +1,7 @@
+{
+  "seed": 43,
+  "sha256": "d982d597be901a700c3a94b9552f7c4af7901c6f08f31e8e460954d854c5c64a",
+  "local_mean_ap": 0.8457565677083332,
+  "public_ap": null,
+  "selection": "Only seed43 passed predefined threshold; 42 and44 did not. Not robustly confirmed."
+}
