@@ -14,6 +14,12 @@
 
 Сильный рецепт (NVIDIA): --tag strong --extra-classes --weights yolo11x.pt --epochs 250 --batch 4 --device 0.
 --tag кладёт всё в outputs/redetect_<tag>, старые результаты не затираются.
+Ансамбль: каждый дополнительный детектор — это «участник» со своим именем, например
+  train   --tag strong --member s1 --seed 1 --weights weights/yolo11l.pt --epochs 250 --batch 4 --device 0
+  predict --tag strong --member s1 --device 0
+  eval    --tag strong --members base s1        (base — участник без имени, обученный первым)
+  submit  --tag strong --members base s1 s2
+Для ансамбля D — доля участников, у которых нет пары с IoU >= 0.6 (0, 1/2, 1 для двух участников).
 --extra-classes добавляет в обучение столы и «отвлекающие» ручные классы (телефоны, тарелки, вещи):
 детектор учится отличать их от чашек и кистей; в согласии участвуют только оцениваемые классы.
 """
@@ -37,6 +43,11 @@ EXTRA = ["table", "phone", "empty_plate", "full_plate", "personal_items", "bottl
 
 policy = json.loads((DATA / "scoring_policy.json").read_text())
 ALIASES = policy["aliases"]
+
+
+def run_name(name, member):
+    """Имя запуска и файла предсказаний участника: day_20261025 для base, day_20261025_s1 для s1."""
+    return name if member in ("", "base") else f"{name}_{member}"
 
 
 def load(name, **kw):
@@ -85,15 +96,15 @@ def train(args):
     from ultralytics import YOLO
     for name in args.sets:
         if args.resume:
-            checkpoint = WORK / "runs" / name / "weights" / "last.pt"
+            checkpoint = WORK / "runs" / run_name(name, args.member) / "weights" / "last.pt"
             if not checkpoint.is_file():
                 raise FileNotFoundError(checkpoint)
             YOLO(checkpoint).train(resume=True, device=args.device)
             continue
         model = YOLO(args.weights)  # публичные COCO-веса Ultralytics, скачиваются автоматически
         model.train(data=str(WORK / "yolo" / name / "data.yaml"), epochs=args.epochs, imgsz=args.imgsz,
-                    batch=args.batch, device=args.device, project=str(WORK / "runs"), name=name, exist_ok=True,
-                    seed=0, deterministic=True, val=False, patience=0, plots=False, flipud=0.0, verbose=False, workers=2)
+                    batch=args.batch, device=args.device, project=str(WORK / "runs"),
+                    name=run_name(name, args.member), exist_ok=True, seed=args.seed, deterministic=True, val=False, patience=0, plots=False, flipud=0.0, verbose=False, workers=2)
 
 
 # ---------------------------------------------------------------- predict
@@ -109,7 +120,7 @@ def predict(args):
         frames = load(f"{split}_frames.csv", dtype={"day": str})
         if day:
             frames = frames[frames.day == day]
-        model = YOLO(WORK / "runs" / name / "weights" / "last.pt")
+        model = YOLO(WORK / "runs" / run_name(name, args.member) / "weights" / "last.pt")
         out = []
         paths = [str(DATA / p) for p in frames.image_path]
         # Bound memory even when the backend interprets a list as one batch.
@@ -123,7 +134,7 @@ def predict(args):
                     out.append((fid, model.names[int(k)], float(c), *map(float, xyxy)))
             print(f"{name}: {min(start + args.predict_batch, len(paths))}/{len(paths)} frames", flush=True)
         df = pd.DataFrame(out, columns=["frame_id", "class_name", "confidence", "x1", "y1", "x2", "y2"])
-        df.to_csv(WORK / f"pred_{name}.csv", index=False)
+        df.to_csv(WORK / f"pred_{run_name(name, args.member)}.csv", index=False)
         print(name, "->", len(frames), "кадров,", len(df), "детекций")
 
 
@@ -175,16 +186,50 @@ def rank01(x):
 
 
 # ---------------------------------------------------------------- eval
+def oof_features(train_df, member):
+    parts = []
+    for det_day, eval_day in (("20261025", "20261026"), ("20261026", "20261025")):
+        ours = pd.read_csv(WORK / f"pred_{run_name('day_' + det_day, member)}.csv")
+        g = train_df[train_df.day == eval_day]
+        parts.append(g.merge(agreement_features(g, ours), on="id"))
+    return pd.concat(parts, ignore_index=True)
+
+
+def ensemble(frames):
+    """Свести таблицы участников: D — доля участников без пары IoU>=0.6, iou_same — средний."""
+    df = frames[0].copy()
+    assert all((f.id.values == df.id.values).all() for f in frames)
+    df["D"] = np.mean([(f.iou_same < 0.6).to_numpy() for f in frames], axis=0)
+    df["iou_same"] = np.mean([f.iou_same.to_numpy() for f in frames], axis=0)
+    return df[[c for c in df.columns if c not in ("conf_at_best", "match_conf", "iou_other", "other_conf", "n_same_03")]]
+
+
+def evaluate_ensemble(train_df, members):
+    frames = [oof_features(train_df, m) for m in members]
+    df = ensemble(frames)
+    df.to_csv(WORK / "oof_features_ens.csv", index=False)
+    rows = {"baseline 1-conf": 1 - df.confidence}
+    for m, f in zip(members, frames):
+        rows[f"участник {m}"] = primary_score(f)
+    rows[f"ансамбль {'+'.join(members)}"] = primary_score(df)
+    for name, s in rows.items():
+        s = pd.Series(np.asarray(s, dtype=float), index=df.index)
+        aps = [average_precision_score(df.error[df.day == d], s[df.day == d]) for d in DAYS]
+        print(f"{name:28s} AP {aps[0]:.4f} {aps[1]:.4f} среднее {np.mean(aps):.4f}")
+    print("Распределение D:", df.D.round(2).value_counts().sort_index().to_dict())
+    oof = ROOT / "oof" / f"{WORK.name}_ens_veto.csv"
+    oof.parent.mkdir(exist_ok=True)
+    df[["id"]].assign(score=primary_score(df)).to_csv(oof, index=False)
+    print("OOF ансамбля:", oof)
+
+
 def evaluate(args):
     train_df = load("train.csv", dtype={"id": str})
     train_df = train_df[train_df.class_name != "table"].copy()
     train_df["day"] = train_df.frame_id.map(frame_day("train"))
-    parts = []
-    for det_day, eval_day in (("20261025", "20261026"), ("20261026", "20261025")):
-        ours = pd.read_csv(WORK / f"pred_day_{det_day}.csv")
-        g = train_df[train_df.day == eval_day]
-        parts.append(g.merge(agreement_features(g, ours), on="id"))
-    df = pd.concat(parts, ignore_index=True)
+    if len(args.members) > 1:
+        return evaluate_ensemble(train_df, args.members)
+    df = oof_features(train_df, args.members[0])
     df.to_csv(WORK / "oof_features.csv", index=False)
 
     base = 1 - df.confidence
@@ -220,22 +265,25 @@ def evaluate(args):
 
 def primary_score(df):
     """Заранее выбранный вариант: бокс без пары IoU>=0.6 у нашего детектора поднимается над остальными."""
-    return ((1 - df.confidence) + (df.iou_same < 0.6)) / 2
+    disagree = df.D if "D" in df else (df.iou_same < 0.6)
+    return ((1 - df.confidence) + disagree) / 2
 
 
 # ---------------------------------------------------------------- submit
-def submit():
+def submit(args):
     test = load("test.csv", dtype={"id": str})
-    ours = pd.read_csv(WORK / "pred_all.csv")
-    df = test.merge(agreement_features(test, ours), on="id")
-    df.to_csv(WORK / "test_features.csv", index=False)
+    frames = [test.merge(agreement_features(test, pd.read_csv(WORK / f"pred_{run_name('all', m)}.csv")), on="id")
+              for m in args.members]
+    many = len(frames) > 1
+    df = ensemble(frames) if many else frames[0]
+    df.to_csv(WORK / ("test_features_ens.csv" if many else "test_features.csv"), index=False)
     template = pd.read_csv(DATA / "sample_submission.csv", dtype={"id": str})
     assert set(template.id) == set(df.id) and df.id.is_unique
-    path = ROOT / "submissions" / f"{WORK.name}_veto.csv"
+    path = ROOT / "submissions" / f"{WORK.name}{'_ens' if many else ''}_veto.csv"
     path.parent.mkdir(exist_ok=True)
     template[["id"]].merge(df[["id"]].assign(score=primary_score(df)), on="id", validate="one_to_one").to_csv(path, index=False)
     print("Доля боксов без пары по классам:")
-    print((df.iou_same < 0.6).groupby(df.class_name).mean().round(2).to_string())
+    print((df.D if many else (df.iou_same < 0.6)).groupby(df.class_name).mean().round(2).to_string())
     print("Файл:", path)
 
 
@@ -250,6 +298,9 @@ if __name__ == "__main__":
     ap.add_argument("--batch", type=int, default=8)
     ap.add_argument("--predict-batch", type=int, default=4)
     ap.add_argument("--device", default="mps")
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--member", default="base", help="имя участника ансамбля для train/predict; base — без суффикса")
+    ap.add_argument("--members", nargs="+", default=["base"], help="участники для eval/submit")
     ap.add_argument("--tag", default="", help="суффикс рабочей папки: outputs/redetect_<tag>")
     ap.add_argument("--extra-classes", action="store_true", help="учить ещё столы и отвлекающие классы")
     a = ap.parse_args()
@@ -259,4 +310,4 @@ if __name__ == "__main__":
         TRAIN_CLASSES = CLASSES + EXTRA
     WORK.mkdir(parents=True, exist_ok=True)
     {"build": lambda: build(), "train": lambda: train(a), "predict": lambda: predict(a), "eval": lambda: evaluate(a),
-     "submit": lambda: submit()}[a.cmd]()
+     "submit": lambda: submit(a)}[a.cmd]()
