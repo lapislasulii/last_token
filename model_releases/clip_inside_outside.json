@@ -6,6 +6,7 @@
     "empty_patch_groups": 0,
     "inside_outside": "Mean contextual patch tokens; padding excluded by patch centers. Not independent masked-image embeddings."
   },
-  "public_ap": null,
-  "local_mean_ap": 0.8341573511233675
+  "public_ap": 0.65682,
+  "local_mean_ap": 0.8341573511233675,
+  "submission_ref": "58302761"
 }
