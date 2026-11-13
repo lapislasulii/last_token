@@ -20,6 +20,7 @@
 import argparse
 import json
 import os
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -65,7 +66,11 @@ def build():
         for fid in frames:
             img = root / "images" / f"{fid}.jpg"
             if not img.exists():
-                os.symlink(DATA / f"{fid}.jpg", img)
+                try:
+                    os.symlink(DATA / f"{fid}.jpg", img)
+                except OSError:
+                    # Windows may disallow symlinks without Developer Mode.
+                    shutil.copy2(DATA / f"{fid}.jpg", img)
             rows = human[human.frame_id == fid]
             (root / "labels" / f"{fid}.txt").write_text("".join(
                 f"{TRAIN_CLASSES.index(r.class_name)} {r.cx:.6f} {r.cy:.6f} {r.w:.6f} {r.h:.6f}\n" for r in rows.itertuples()))
@@ -79,10 +84,16 @@ def build():
 def train(args):
     from ultralytics import YOLO
     for name in args.sets:
+        if args.resume:
+            checkpoint = WORK / "runs" / name / "weights" / "last.pt"
+            if not checkpoint.is_file():
+                raise FileNotFoundError(checkpoint)
+            YOLO(checkpoint).train(resume=True, device=args.device)
+            continue
         model = YOLO(args.weights)  # публичные COCO-веса Ultralytics, скачиваются автоматически
         model.train(data=str(WORK / "yolo" / name / "data.yaml"), epochs=args.epochs, imgsz=args.imgsz,
                     batch=args.batch, device=args.device, project=str(WORK / "runs"), name=name, exist_ok=True,
-                    seed=0, deterministic=True, val=False, plots=False, flipud=0.0, verbose=False, workers=2)
+                    seed=0, deterministic=True, val=False, patience=0, plots=False, flipud=0.0, verbose=False, workers=2)
 
 
 # ---------------------------------------------------------------- predict
@@ -101,11 +112,16 @@ def predict(args):
         model = YOLO(WORK / "runs" / name / "weights" / "last.pt")
         out = []
         paths = [str(DATA / p) for p in frames.image_path]
-        for fid, res in zip(frames.frame_id, model.predict(paths, imgsz=args.imgsz, conf=0.01, iou=0.6, device=args.device,
-                                                             stream=True, verbose=False, max_det=200)):
-            b = res.boxes
-            for xyxy, c, k in zip(b.xyxy.cpu().numpy(), b.conf.cpu().numpy(), b.cls.cpu().numpy().astype(int)):
-                out.append((fid, model.names[int(k)], float(c), *map(float, xyxy)))
+        # Bound memory even when the backend interprets a list as one batch.
+        for start in range(0, len(paths), args.predict_batch):
+            results = model.predict(paths[start:start + args.predict_batch], imgsz=args.imgsz,
+                                    conf=0.01, iou=0.6, device=args.device,
+                                    stream=True, verbose=False, max_det=200)
+            for fid, res in zip(frames.frame_id.iloc[start:start + args.predict_batch], results):
+                b = res.boxes
+                for xyxy, c, k in zip(b.xyxy.cpu().numpy(), b.conf.cpu().numpy(), b.cls.cpu().numpy().astype(int)):
+                    out.append((fid, model.names[int(k)], float(c), *map(float, xyxy)))
+            print(f"{name}: {min(start + args.predict_batch, len(paths))}/{len(paths)} frames", flush=True)
         df = pd.DataFrame(out, columns=["frame_id", "class_name", "confidence", "x1", "y1", "x2", "y2"])
         df.to_csv(WORK / f"pred_{name}.csv", index=False)
         print(name, "->", len(frames), "кадров,", len(df), "детекций")
@@ -228,9 +244,11 @@ if __name__ == "__main__":
     ap.add_argument("cmd", choices=["build", "train", "predict", "eval", "submit"])
     ap.add_argument("--sets", nargs="+", default=["day_20261025", "day_20261026"])
     ap.add_argument("--weights", default="yolo11s.pt")
+    ap.add_argument("--resume", action="store_true", help="продолжить выбранные наборы с сохранённого last.pt")
     ap.add_argument("--epochs", type=int, default=80)
     ap.add_argument("--imgsz", type=int, default=1280)
     ap.add_argument("--batch", type=int, default=8)
+    ap.add_argument("--predict-batch", type=int, default=4)
     ap.add_argument("--device", default="mps")
     ap.add_argument("--tag", default="", help="суффикс рабочей папки: outputs/redetect_<tag>")
     ap.add_argument("--extra-classes", action="store_true", help="учить ещё столы и отвлекающие классы")

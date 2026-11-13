@@ -90,6 +90,7 @@ __pycache__/
 build/
 dist/
 .venv/
+.venv-redetect/
 venv/
 env/
 .python-version
