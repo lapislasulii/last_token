@@ -60,6 +60,17 @@ def run_name(name, member):
     return name if member in ("", "base") else f"{name}_{member}"
 
 
+FLIP = "_flip"
+
+
+def pred_path(name, member):
+    """Файл предсказаний участника. Участник «s1_flip» — те же веса s1 на отражённых кадрах (TTA):
+    pred_all_s1_flip.csv; для base — pred_all_flip.csv."""
+    if member.endswith(FLIP):
+        return WORK / f"pred_{run_name(name, member[:-len(FLIP)])}{FLIP}.csv"
+    return WORK / f"pred_{run_name(name, member)}.csv"
+
+
 def members_suffix(members):
     """Суффикс файлов результата: '' для base, '_s1' для одного участника, '_ens-base-s1-s2' для ансамбля.
 
@@ -262,16 +273,24 @@ def predict(args):
         paths = [str(DATA / p) for p in frames.image_path]
         # Bound memory even when the backend interprets a list as one batch.
         for start in range(0, len(paths), args.predict_batch):
-            results = model.predict(paths[start:start + args.predict_batch], imgsz=args.imgsz,
+            batch = paths[start:start + args.predict_batch]
+            if args.flip:  # отражаем кадр по горизонтали, боксы потом отражаем обратно
+                import cv2
+                batch = [np.ascontiguousarray(cv2.imread(p)[:, ::-1]) for p in batch]
+            results = model.predict(batch, imgsz=args.imgsz,
                                     conf=0.01, iou=0.6, device=args.device,
                                     stream=True, verbose=False, max_det=200)
             for fid, res in zip(frames.frame_id.iloc[start:start + args.predict_batch], results):
                 b = res.boxes
-                for xyxy, c, k in zip(b.xyxy.cpu().numpy(), b.conf.cpu().numpy(), b.cls.cpu().numpy().astype(int)):
+                xyxy_all = b.xyxy.cpu().numpy()
+                if args.flip:
+                    w = res.orig_shape[1]
+                    xyxy_all = np.stack([w - xyxy_all[:, 2], xyxy_all[:, 1], w - xyxy_all[:, 0], xyxy_all[:, 3]], axis=1)
+                for xyxy, c, k in zip(xyxy_all, b.conf.cpu().numpy(), b.cls.cpu().numpy().astype(int)):
                     out.append((fid, model.names[int(k)], float(c), *map(float, xyxy)))
             print(f"{name}: {min(start + args.predict_batch, len(paths))}/{len(paths)} frames", flush=True)
         df = pd.DataFrame(out, columns=["frame_id", "class_name", "confidence", "x1", "y1", "x2", "y2"])
-        df.to_csv(WORK / f"pred_{run_name(name, args.member)}.csv", index=False)
+        df.to_csv(pred_path(name, args.member + (FLIP if args.flip else "")), index=False)
         print(name, "->", len(frames), "кадров,", len(df), "детекций")
 
 
@@ -340,7 +359,7 @@ def rank01(x):
 def oof_features(train_df, member):
     parts = []
     for det_day, eval_day in (("20261025", "20261026"), ("20261026", "20261025")):
-        ours = pd.read_csv(WORK / f"pred_{run_name('day_' + det_day, member)}.csv")
+        ours = pd.read_csv(pred_path("day_" + det_day, member))
         g = train_df[train_df.day == eval_day]
         parts.append(g.merge(agreement_features(g, ours), on="id"))
     return pd.concat(parts, ignore_index=True)
@@ -434,7 +453,7 @@ def primary_score(df):
 # ---------------------------------------------------------------- submit
 def submit(args):
     test = load("test.csv", dtype={"id": str})
-    frames = [test.merge(agreement_features(test, pd.read_csv(WORK / f"pred_{run_name('all', m)}.csv")), on="id")
+    frames = [test.merge(agreement_features(test, pd.read_csv(pred_path("all", m))), on="id")
               for m in args.members]
     many = len(frames) > 1
     df = ensemble(frames) if many else frames[0]
@@ -472,7 +491,9 @@ if __name__ == "__main__":
     ap.add_argument("--device", default="mps")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--member", default="base", help="имя участника ансамбля для train/predict; base — без суффикса")
-    ap.add_argument("--members", nargs="+", default=["base"], help="участники для eval/submit")
+    ap.add_argument("--members", nargs="+", default=["base"],
+                    help="участники для eval/submit; суффикс _flip — прогон на отражённых кадрах (base_flip, s1_flip)")
+    ap.add_argument("--flip", action="store_true", help="predict: отразить кадры по горизонтали (TTA), файл pred_*_flip.csv")
     ap.add_argument("--tag", default="", help="суффикс рабочей папки: outputs/redetect_<tag>")
     ap.add_argument("--extra-classes", action="store_true", help="учить ещё столы и отвлекающие классы")
     a = ap.parse_args()
