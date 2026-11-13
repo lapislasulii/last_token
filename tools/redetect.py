@@ -20,6 +20,7 @@
   eval    --tag strong --members base s1        (base — участник без имени, обученный первым)
   submit  --tag strong --members base s1 s2
 Для ансамбля D — доля участников, у которых нет пары с IoU >= 0.6 (0, 1/2, 1 для двух участников).
+Это голосование, координаты боксов не усредняются. Состав ансамбля входит в имена файлов результата.
 --extra-classes добавляет в обучение столы и «отвлекающие» ручные классы (телефоны, тарелки, вещи):
 детектор учится отличать их от чашек и кистей; в согласии участвуют только оцениваемые классы.
 """
@@ -48,6 +49,26 @@ ALIASES = policy["aliases"]
 def run_name(name, member):
     """Имя запуска и файла предсказаний участника: day_20261025 для base, day_20261025_s1 для s1."""
     return name if member in ("", "base") else f"{name}_{member}"
+
+
+def members_suffix(members):
+    """Суффикс файлов результата: '' для base, '_s1' для одного участника, '_ens-base-s1-s2' для ансамбля.
+
+    Состав ансамбля входит в имя, поэтому ансамбли из трёх и четырёх моделей не перезаписывают друг друга,
+    а отдельная оценка участника s1 не затирает файлы base.
+    """
+    if len(members) > 1:
+        return "_ens-" + "-".join(members)
+    return "" if members[0] in ("", "base") else f"_{members[0]}"
+
+
+def veto_rows(df, split):
+    """Добавить вето экспертов (tools/expert_veto.py), если оно посчитано; иначе None."""
+    path = ROOT / "outputs" / "expert_veto" / f"{split}_features.csv"
+    if not path.exists():
+        return None
+    veto = pd.read_csv(path, dtype={"id": str})[["id", "veto"]]
+    return df[["id"]].merge(veto, on="id", how="left", validate="one_to_one").veto.to_numpy()
 
 
 def load(name, **kw):
@@ -207,17 +228,27 @@ def ensemble(frames):
 def evaluate_ensemble(train_df, members):
     frames = [oof_features(train_df, m) for m in members]
     df = ensemble(frames)
-    df.to_csv(WORK / "oof_features_ens.csv", index=False)
+    suffix = members_suffix(members)
+    df.to_csv(WORK / f"oof_features{suffix}.csv", index=False)
+    veto = veto_rows(df, "train")
     rows = {"baseline 1-conf": 1 - df.confidence}
     for m, f in zip(members, frames):
         rows[f"участник {m}"] = primary_score(f)
     rows[f"ансамбль {'+'.join(members)}"] = primary_score(df)
+    if veto is not None:  # итоговое сочетание, по нему и принимается решение
+        for m, f in zip(members, frames):
+            rows[f"участник {m} + вето"] = (primary_score(f) + veto) / 2
+        rows[f"ансамбль {'+'.join(members)} + вето"] = (primary_score(df) + veto) / 2
+    else:
+        print("Вето экспертов не найдено: сначала python tools/expert_veto.py train")
     for name, s in rows.items():
         s = pd.Series(np.asarray(s, dtype=float), index=df.index)
         aps = [average_precision_score(df.error[df.day == d], s[df.day == d]) for d in DAYS]
-        print(f"{name:28s} AP {aps[0]:.4f} {aps[1]:.4f} среднее {np.mean(aps):.4f}")
+        print(f"{name:34s} AP {aps[0]:.4f} {aps[1]:.4f} среднее {np.mean(aps):.4f}")
     print("Распределение D:", df.D.round(2).value_counts().sort_index().to_dict())
-    oof = ROOT / "oof" / f"{WORK.name}_ens_veto.csv"
+    flips = np.mean([(f.iou_same < 0.6).to_numpy() for f in frames], axis=0)
+    print(f"Боксов, по которым участники расходятся: {int(((flips > 0) & (flips < 1)).sum())} из {len(df)}")
+    oof = ROOT / "oof" / f"{WORK.name}{suffix}_veto.csv"
     oof.parent.mkdir(exist_ok=True)
     df[["id"]].assign(score=primary_score(df)).to_csv(oof, index=False)
     print("OOF ансамбля:", oof)
@@ -229,8 +260,9 @@ def evaluate(args):
     train_df["day"] = train_df.frame_id.map(frame_day("train"))
     if len(args.members) > 1:
         return evaluate_ensemble(train_df, args.members)
+    suffix = members_suffix(args.members)
     df = oof_features(train_df, args.members[0])
-    df.to_csv(WORK / "oof_features.csv", index=False)
+    df.to_csv(WORK / f"oof_features{suffix}.csv", index=False)
 
     base = 1 - df.confidence
     agree = df.match_conf  # 0, если наш детектор не нарисовал совпадающий бокс
@@ -256,8 +288,8 @@ def evaluate(args):
         if 0 < g.error.sum() < len(g):
             print(f"  {c:11s} n={len(g):3d}  base={average_precision_score(g.error, 1 - g.confidence):.3f}"
                   f"  ours={average_precision_score(g.error, 1 - g.match_conf):.3f}")
-    res.to_csv(WORK / "eval_heuristics.csv", index=False)
-    oof = ROOT / "oof" / f"{WORK.name}_veto.csv"
+    res.to_csv(WORK / f"eval_heuristics{suffix}.csv", index=False)
+    oof = ROOT / "oof" / f"{WORK.name}{suffix}_veto.csv"
     oof.parent.mkdir(exist_ok=True)
     df[["id"]].assign(score=primary_score(df)).to_csv(oof, index=False)
     print("OOF основного варианта:", oof)
@@ -276,10 +308,11 @@ def submit(args):
               for m in args.members]
     many = len(frames) > 1
     df = ensemble(frames) if many else frames[0]
-    df.to_csv(WORK / ("test_features_ens.csv" if many else "test_features.csv"), index=False)
+    suffix = members_suffix(args.members)
+    df.to_csv(WORK / f"test_features{suffix}.csv", index=False)
     template = pd.read_csv(DATA / "sample_submission.csv", dtype={"id": str})
     assert set(template.id) == set(df.id) and df.id.is_unique
-    path = ROOT / "submissions" / f"{WORK.name}{'_ens' if many else ''}_veto.csv"
+    path = ROOT / "submissions" / f"{WORK.name}{suffix}_veto.csv"
     path.parent.mkdir(exist_ok=True)
     template[["id"]].merge(df[["id"]].assign(score=primary_score(df)), on="id", validate="one_to_one").to_csv(path, index=False)
     print("Доля боксов без пары по классам:")
