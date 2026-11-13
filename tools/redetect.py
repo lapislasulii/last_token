@@ -131,7 +131,7 @@ def train(args):
             YOLO(checkpoint).train(resume=True, device=args.device)
             continue
         model = YOLO(args.weights)  # публичные COCO-веса Ultralytics, скачиваются автоматически
-        data_dir = WORK / "yolo" / (f"student_{name}" if args.student else name)
+        data_dir = WORK / "yolo" / (f"student_{name}{args.student_tag}" if args.student else name)
         if not (data_dir / "data.yaml").is_file():
             raise FileNotFoundError(f"{data_dir / 'data.yaml'}: сначала build" + (" и pseudo" if args.student else ""))
         model.train(data=str(data_dir / "data.yaml"), epochs=args.epochs, imgsz=args.imgsz,
@@ -155,9 +155,14 @@ def link(src, dst):
 def pseudo(args):
     """Учитель размечает кадры пула своего дня; собирается набор ученика: ручные кадры (с повтором) + псевдокадры."""
     from ultralytics import YOLO
+    from pseudo_filter import rejection_reasons
+    if not 0 <= args.pseudo_low < args.pseudo_conf <= 1:
+        raise ValueError('Require 0 <= pseudo-low < pseudo-conf <= 1')
     pool = pd.read_csv(DATA / "machine_frames.csv")
     pool["day"] = pd.to_datetime(pool.timestamp, utc=True, format="mixed").dt.strftime("%Y%m%d")
     pool = pool[pool.image_exists.astype(bool)]
+    forbidden = set(load('train_frames.csv').frame_id) | set(load('test_frames.csv').frame_id)
+    pool = pool[~pool.frame_id.isin(forbidden)]
     mp = load("machine_predictions.csv")
     with_people = set(mp[(mp.class_name == "person") & (mp.confidence >= 0.5)].frame_id)
     for name in args.sets:
@@ -178,9 +183,9 @@ def pseudo(args):
                             rest.sample(n_rest, random_state=args.seed)]).sort_values("timestamp")
         print(f"{name}: пул дней {POOL_DAYS[name]}, кадров с людьми {len(people)}, выбрано {len(chosen)}", flush=True)
 
-        root = WORK / "yolo" / f"student_{name}"
+        root = WORK / "yolo" / f"student_{name}{args.student_tag}"
         if root.exists():
-            shutil.rmtree(root)  # набор ученика пересобирается целиком, без хвостов прошлых запусков
+            raise FileExistsError(f'{root}: use a separate --student-tag; existing data will not be overwritten')
         for sub in ("images", "labels"):
             (root / sub).mkdir(parents=True)
         # 1) настоящие ручные кадры, повторённые --real-repeat раз, чтобы псевдоразметка их не задавила
@@ -196,6 +201,7 @@ def pseudo(args):
                 n_real += 1
         # 2) псевдоразметка пула
         rows, kept, skipped = [], 0, 0
+        audit = []
         paths = [str(DATA / p) for p in chosen.image_path]
         for start in range(0, len(paths), args.predict_batch):
             batch = chosen.iloc[start:start + args.predict_batch]
@@ -206,13 +212,20 @@ def pseudo(args):
                 conf = b.conf.cpu().numpy()
                 names = [teacher.names[int(k)] for k in b.cls.cpu().numpy()]
                 xywhn = b.xywhn.cpu().numpy()
-                for c, n, box in zip(conf, names, b.xyxy.cpu().numpy() * (1280 / res.orig_shape[1])):
+                scaled_boxes = b.xyxy.cpu().numpy() * np.array([1280/res.orig_shape[1], 720/res.orig_shape[0]]*2)
+                for c, n, box in zip(conf, names, scaled_boxes):
                     rows.append((fid, n, float(c), *map(float, box)))
-                # кадр с неуверенным person пропускаем целиком: неизвестно, человек это или фон, и любое
-                # решение учило бы ученика ошибке учителя. Неуверенные мелкие классы просто не попадают в метки
-                # (иначе отсеялись бы почти все людные сцены — там всегда есть сомнительная рука).
-                ambiguous = any(n == "person" and c < args.pseudo_conf for c, n in zip(conf, names))
-                if ambiguous:
+                # Reject incomplete target labels and unconfirmed original people.
+                original_people = mp[(mp.frame_id == fid) & (mp.class_name == 'person') & (mp.confidence >= .5)]
+                reasons = rejection_reasons(names, conf, scaled_boxes,
+                    original_people[['x1','y1','x2','y2']].to_numpy(),
+                    low=args.pseudo_low, high=args.pseudo_conf, person_iou=args.pseudo_person_iou)
+                audit.append(dict(frame_id=fid, day=POOL_DAYS[name], accepted=not reasons,
+                    reasons=';'.join(reasons), teacher=str(teacher_path),
+                    pseudo_low=args.pseudo_low, pseudo_conf=args.pseudo_conf,
+                    person_iou=args.pseudo_person_iou,
+                    kept_counts=json.dumps({n:int(sum(n == k and c >= args.pseudo_conf for k,c in zip(names,conf))) for n in TRAIN_CLASSES})))
+                if reasons:
                     skipped += 1
                     continue
                 keep = [(n, box) for c, n, box in zip(conf, names, xywhn) if c >= args.pseudo_conf]
@@ -224,7 +237,8 @@ def pseudo(args):
         (root / "data.yaml").write_text(
             f"path: {root}\ntrain: images\nval: images\nnames:\n" + "".join(f"  {i}: {c}\n" for i, c in enumerate(TRAIN_CLASSES)))
         pd.DataFrame(rows, columns=["frame_id", "class_name", "confidence", "x1", "y1", "x2", "y2"]).to_csv(
-            WORK / f"pseudo_{name}_{args.teacher}.csv", index=False)
+            WORK / f"pseudo_{name}_{args.teacher}{args.student_tag}.csv", index=False)
+        pd.DataFrame(audit).to_csv(WORK / f'pseudo_audit_{name}{args.student_tag}.csv', index=False)
         print(f"{name}: ручных кадров {n_real} (x{args.real_repeat}), псевдокадров {kept}, "
               f"пропущено неоднозначных {skipped}; набор {root}")
 
@@ -425,6 +439,8 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("cmd", choices=["build", "train", "pseudo", "predict", "eval", "submit"])
     ap.add_argument("--student", action="store_true", help="train: учить на наборе student_<набор> (после pseudo)")
+    ap.add_argument('--student-tag', default='', help='Separate dataset suffix, e.g. _strict80')
+    ap.add_argument('--pseudo-person-iou', type=float, default=.3, help='Minimum teacher overlap confirming each original person')
     ap.add_argument("--teacher", default="base", help="pseudo: участник-учитель")
     ap.add_argument("--pool-frames", type=int, default=1500, help="pseudo: сколько кадров пула на набор")
     ap.add_argument("--pseudo-conf", type=float, default=0.5, help="pseudo: порог уверенности псевдобокса")
