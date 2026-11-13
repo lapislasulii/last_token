@@ -9,7 +9,13 @@
   build    — собрать YOLO-датасеты: day_20261025, day_20261026, all (оба дня, для test)
   train    — дообучить детектор на каждом наборе
   predict  — прогнать детекторы по нужным кадрам, сохранить детекции
-  eval     — признаки согласия + AP по дням против бейзлайна
+  eval     — признаки согласия + AP по дням против бейзлайна, OOF-файл для evaluate_predictions.py
+  submit   — предсказания для test детектором, обученным на обоих днях (набор all)
+
+Сильный рецепт (NVIDIA): --tag strong --extra-classes --weights yolo11x.pt --epochs 250 --batch 4 --device 0.
+--tag кладёт всё в outputs/redetect_<tag>, старые результаты не затираются.
+--extra-classes добавляет в обучение столы и «отвлекающие» ручные классы (телефоны, тарелки, вещи):
+детектор учится отличать их от чашек и кистей; в согласии участвуют только оцениваемые классы.
 """
 import argparse
 import json
@@ -25,6 +31,8 @@ DATA = ROOT / "data" / "rascar-hack-case-1"
 WORK = ROOT / "outputs" / "redetect"
 DAYS = ["20261025", "20261026"]
 CLASSES = ["person", "nude_hands", "cup", "tray"]  # оцениваемые классы, которые реально встречаются
+TRAIN_CLASSES = CLASSES  # с --extra-classes сюда добавляется EXTRA
+EXTRA = ["table", "phone", "empty_plate", "full_plate", "personal_items", "bottle", "hair", "uniform_not_ok"]
 
 policy = json.loads((DATA / "scoring_policy.json").read_text())
 ALIASES = policy["aliases"]
@@ -45,7 +53,7 @@ def frame_day(split):
 # ---------------------------------------------------------------- build
 def build():
     human = load("human_boxes_train.csv")
-    human = human[human.class_name.isin(CLASSES)]
+    human = human[human.class_name.isin(TRAIN_CLASSES)]
     day_of = frame_day("train")
     targets = load("train_context.csv").frame_id  # кадры с ручной разметкой
     sets = {f"day_{d}": [f for f in targets if day_of[f] == d] for d in DAYS}
@@ -60,10 +68,10 @@ def build():
                 os.symlink(DATA / f"{fid}.jpg", img)
             rows = human[human.frame_id == fid]
             (root / "labels" / f"{fid}.txt").write_text("".join(
-                f"{CLASSES.index(r.class_name)} {r.cx:.6f} {r.cy:.6f} {r.w:.6f} {r.h:.6f}\n" for r in rows.itertuples()))
+                f"{TRAIN_CLASSES.index(r.class_name)} {r.cx:.6f} {r.cy:.6f} {r.w:.6f} {r.h:.6f}\n" for r in rows.itertuples()))
         # val = тот же набор: другой день нельзя использовать для отбора эпох
         (root / "data.yaml").write_text(
-            f"path: {root}\ntrain: images\nval: images\nnames:\n" + "".join(f"  {i}: {c}\n" for i, c in enumerate(CLASSES)))
+            f"path: {root}\ntrain: images\nval: images\nnames:\n" + "".join(f"  {i}: {c}\n" for i, c in enumerate(TRAIN_CLASSES)))
         print(name, len(frames), "кадров,", int(human.frame_id.isin(frames).sum()), "боксов")
 
 
@@ -97,7 +105,7 @@ def predict(args):
                                                              stream=True, verbose=False, max_det=200)):
             b = res.boxes
             for xyxy, c, k in zip(b.xyxy.cpu().numpy(), b.conf.cpu().numpy(), b.cls.cpu().numpy().astype(int)):
-                out.append((fid, CLASSES[k], float(c), *map(float, xyxy)))
+                out.append((fid, model.names[int(k)], float(c), *map(float, xyxy)))
         df = pd.DataFrame(out, columns=["frame_id", "class_name", "confidence", "x1", "y1", "x2", "y2"])
         df.to_csv(WORK / f"pred_{name}.csv", index=False)
         print(name, "->", len(frames), "кадров,", len(df), "детекций")
@@ -172,6 +180,8 @@ def evaluate(args):
         "1 - iou_same*conf_at_best": 1 - df.iou_same * df.conf_at_best,
         "rank-avg(base, 1-match_conf)": (rank01(base) + rank01(1 - agree)) / 2,
         "rank-avg(base, 1-iou_same)": (rank01(base) + rank01(1 - df.iou_same)) / 2,
+        "veto: (base + [iou_same<0.6]) / 2": primary_score(df),
+        "veto, только person": (base + ((df.iou_same < 0.6) & (df.class_name == "person"))) / 2,
     }
     rows = []
     for name, s in candidates.items():
@@ -186,17 +196,49 @@ def evaluate(args):
             print(f"  {c:11s} n={len(g):3d}  base={average_precision_score(g.error, 1 - g.confidence):.3f}"
                   f"  ours={average_precision_score(g.error, 1 - g.match_conf):.3f}")
     res.to_csv(WORK / "eval_heuristics.csv", index=False)
+    oof = ROOT / "oof" / f"{WORK.name}_veto.csv"
+    oof.parent.mkdir(exist_ok=True)
+    df[["id"]].assign(score=primary_score(df)).to_csv(oof, index=False)
+    print("OOF основного варианта:", oof)
+
+
+def primary_score(df):
+    """Заранее выбранный вариант: бокс без пары IoU>=0.6 у нашего детектора поднимается над остальными."""
+    return ((1 - df.confidence) + (df.iou_same < 0.6)) / 2
+
+
+# ---------------------------------------------------------------- submit
+def submit():
+    test = load("test.csv", dtype={"id": str})
+    ours = pd.read_csv(WORK / "pred_all.csv")
+    df = test.merge(agreement_features(test, ours), on="id")
+    df.to_csv(WORK / "test_features.csv", index=False)
+    template = pd.read_csv(DATA / "sample_submission.csv", dtype={"id": str})
+    assert set(template.id) == set(df.id) and df.id.is_unique
+    path = ROOT / "submissions" / f"{WORK.name}_veto.csv"
+    path.parent.mkdir(exist_ok=True)
+    template[["id"]].merge(df[["id"]].assign(score=primary_score(df)), on="id", validate="one_to_one").to_csv(path, index=False)
+    print("Доля боксов без пары по классам:")
+    print((df.iou_same < 0.6).groupby(df.class_name).mean().round(2).to_string())
+    print("Файл:", path)
 
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["build", "train", "predict", "eval"])
+    ap.add_argument("cmd", choices=["build", "train", "predict", "eval", "submit"])
     ap.add_argument("--sets", nargs="+", default=["day_20261025", "day_20261026"])
     ap.add_argument("--weights", default="yolo11s.pt")
     ap.add_argument("--epochs", type=int, default=80)
     ap.add_argument("--imgsz", type=int, default=1280)
     ap.add_argument("--batch", type=int, default=8)
     ap.add_argument("--device", default="mps")
+    ap.add_argument("--tag", default="", help="суффикс рабочей папки: outputs/redetect_<tag>")
+    ap.add_argument("--extra-classes", action="store_true", help="учить ещё столы и отвлекающие классы")
     a = ap.parse_args()
+    if a.tag:
+        WORK = ROOT / "outputs" / f"redetect_{a.tag}"
+    if a.extra_classes:
+        TRAIN_CLASSES = CLASSES + EXTRA
     WORK.mkdir(parents=True, exist_ok=True)
-    {"build": lambda: build(), "train": lambda: train(a), "predict": lambda: predict(a), "eval": lambda: evaluate(a)}[a.cmd]()
+    {"build": lambda: build(), "train": lambda: train(a), "predict": lambda: predict(a), "eval": lambda: evaluate(a),
+     "submit": lambda: submit()}[a.cmd]()
