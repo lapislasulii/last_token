@@ -1,3 +1,5 @@
+> **Обновление 13 ноября:** пользователь отправил CLIP (0.66617, новый лучший Public) и DINOv2-large (0.65904). Small с рамкой — 0.66398. Ниже сохранены результаты локальных экспериментов; прежние фразы об отсутствии отправок относятся к моменту эксперимента. [Актуальные результаты](kaggle_results.md).
+
 # CLIP ViT-L/14: другой encoder
 
 Источник весов: https://huggingface.co/openai/clip-vit-large-patch14 . Revision 32bd64288804d66eefd0ccbe215aa642df71cc41. Замороженный CLIPVisionModel, post-layernorm CLS (1024 признака), без текстовой ветки и projection. Нормализация из опубликованного image processor CLIP; изображение то же: crop1.5x, pad224, рамка2px. PCA16 и остаточная линейная голова обучены внутри каждого day fold. Два штрафа, lambda=1 и 10.
