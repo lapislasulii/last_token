@@ -18,12 +18,15 @@ import pandas as pd
 from PIL import Image, ImageDraw, ImageFont
 
 ROOT = Path(__file__).resolve().parents[1]
-COLORS = {"correct": "#16a34a", "error": "#dc2626", "unknown": "#ca8a04", "human": "#2563eb"}
+COLORS = {"correct": "#22c55e", "error": "#ef4444", "unknown": "#eab308", "human": "#3b82f6", "table": "#ffffff"}
 
 
 class Dataset:
-    def __init__(self, folder: Path):
+    def __init__(self, folder: Path, scores: dict | None = None):
         self.folder = folder.resolve()
+        self.scores = {}       # split -> {id: (score, место в очереди, размер очереди)}
+        self.worst = {}        # split -> кадры, отсортированные по числу промахов модели
+        self.score_files = {}
         policy = json.loads((folder / "scoring_policy.json").read_text(encoding="utf-8"))
         aliases = policy.get("aliases", {})
         self.excluded = set(policy.get("test_excluded_classes", []))
@@ -60,6 +63,25 @@ class Dataset:
         human = pd.read_csv(folder / "human_boxes_train.csv")
         human["class_name"] = human.class_name.replace(aliases)
         self.human = {key: group for key, group in human.groupby("frame_id")}
+        for split, path in (scores or {}).items():
+            self.load_scores(split, path)
+
+    def load_scores(self, split, path: Path):
+        """Score модели (id,score). Очередь — как в метрике: train по UTC-дням, test целиком."""
+        s = pd.read_csv(path, dtype={"id": str})[["id", "score"]]
+        rows = pd.read_csv(self.folder / f"{split}.csv", dtype={"id": str, "frame_id": str})
+        rows = rows[~rows.class_name.replace({}).isin(self.excluded)].merge(s, on="id", how="inner")
+        rows["day"] = rows.frame_id.str.extract(r"_(2026\d{4})_")[0] if split == "train" else "all"
+        rows["rank"] = rows.groupby("day").score.rank(ascending=False, method="min").astype(int)
+        rows["n"] = rows.groupby("day").score.transform("size")
+        self.scores[split] = {r.id: (float(r.score), int(r.rank), int(r.n)) for r in rows.itertuples()}
+        self.score_files[split] = path.name
+        if "error" in rows:
+            # промах: ошибка в нижней половине очереди или верный бокс в верхней четверти
+            pct = rows["rank"] / rows.n
+            rows["miss"] = ((rows.error == 1) & (pct > 0.5)) | ((rows.error == 0) & (pct <= 0.25))
+            counts = rows.groupby("frame_id").miss.sum()
+            self.worst[split] = [f for f, c in counts.sort_values(ascending=False).items() if c > 0]
 
     def image_path(self, split, frame_id):
         row = self.frames[split][frame_id]
@@ -82,12 +104,17 @@ class Dataset:
             for r in predictions.to_dict("records"):
                 error = r.get("error")
                 status = "unknown" if error is None or pd.isna(error) else ("error" if int(error) else "correct")
-                boxes.append({"kind": "machine", "class_name": r["class_name"], "id": str(r["detection_id"]), "confidence": float(r["confidence"]), "status": status, "excluded": r["class_name"] in self.excluded,
-                              "xyxy": [float(r["x1"]) * sx, float(r["y1"]) * sy, float(r["x2"]) * sx, float(r["y2"]) * sy]})
+                box = {"kind": "machine", "class_name": r["class_name"], "id": str(r["detection_id"]), "confidence": float(r["confidence"]), "status": status, "excluded": r["class_name"] in self.excluded,
+                       "xyxy": [float(r["x1"]) * sx, float(r["y1"]) * sy, float(r["x2"]) * sx, float(r["y2"]) * sy]}
+                scored = self.scores.get(split, {}).get(str(r["detection_id"]))
+                if scored:
+                    box["score"], box["rank"], box["queue"] = scored
+                boxes.append(box)
         humans = self.human.get(frame_id) if split == "train" else None
         if humans is not None:
             for r in humans.to_dict("records"):
-                boxes.append({"kind": "human", "class_name": r["class_name"], "status": "human", "source": r.get("source", ""), "excluded": r["class_name"] in self.excluded,
+                scored = bool(r.get("evaluated_class", True)) and r["class_name"] not in self.excluded
+                boxes.append({"kind": "human", "class_name": r["class_name"], "status": "human", "source": r.get("source", ""), "excluded": r["class_name"] in self.excluded, "scored": scored,
                               "xyxy": [(float(r["cx"]) - float(r["w"])/2)*width, (float(r["cy"]) - float(r["h"])/2)*height, (float(r["cx"]) + float(r["w"])/2)*width, (float(r["cy"]) + float(r["h"])/2)*height]})
         ctx = self.context.get(split, {}).get(frame_id)
         if ctx is None and split == "machine":
@@ -100,35 +127,38 @@ class Dataset:
 
 def box_label(box):
     if box["kind"] == "human":
-        return f"GT {box['class_name']} ({box['source']})"
-    error = {"correct": "0", "error": "1", "unknown": "?"}[box["status"]]
-    suffix = " [not scored]" if box["excluded"] else ""
-    return f"{box['class_name']} conf={box['confidence']:.2f} error={error}{suffix}"
+        return box["class_name"]
+    return f"{box['class_name']} {box['confidence']:.2f}"
 
 
-def export_image(dataset, split, frame_id, output, humans=True, machines=True, tables=False):
+def export_image(dataset, split, frame_id, output, humans=True, machines=True, tables=False, labels=False, other=False):
+    """Те же цвета, что в браузере: синий — ручной, зелёный/красный — детектор верно/ошибка, белый — стол."""
     data = dataset.payload(split, frame_id)
     with Image.open(dataset.image_path(split, frame_id)) as source:
         image = source.convert("RGB")
     draw = ImageDraw.Draw(image)
     font = ImageFont.load_default(size=14)
-    for box in sorted(data["boxes"], key=lambda b: b["kind"] != "human"):
-        if (box["excluded"] and not tables) or (box["kind"] == "human" and not humans) or (box["kind"] == "machine" and not machines):
+    for box in sorted(data["boxes"], key=lambda b: (b["kind"] != "human", b["excluded"])):
+        is_table = box["excluded"]
+        if box["kind"] == "human" and (not humans or is_table or (not box["scored"] and not other)):
             continue
-        color = COLORS[box["status"]]
+        if box["kind"] == "machine" and (not machines or (is_table and not tables)):
+            continue
+        color = COLORS["table"] if is_table else COLORS[box["status"]]
         coords = box["xyxy"]
-        draw.rectangle(coords, outline=color, width=2 if box["kind"] == "human" else 3)
-        label = box_label(box)
-        bounds = draw.textbbox((0, 0), label, font=font)
-        x = max(0, min(coords[0], image.width - bounds[2]))
-        y = max(0, coords[1] - (18 if box["kind"] == "human" else 36))
-        draw.rectangle((x, y, x+bounds[2], y+18), fill="#111827")
-        draw.text((x, y), label, font=font, fill=color)
+        draw.rectangle(coords, outline=color, width=2 if is_table else (4 if box["kind"] == "human" else 3))
+        if labels and not is_table:
+            label = box_label(box)
+            bounds = draw.textbbox((0, 0), label, font=font)
+            x = max(0, min(coords[0], image.width - bounds[2]))
+            y = max(0, coords[1] - 18)
+            draw.rectangle((x, y, x + bounds[2], y + 18), fill="#111827")
+            draw.text((x, y), label, font=font, fill=color)
     banner = Image.new("RGB", (image.width, image.height + 65), "#111827")
     banner.paste(image, (0, 65))
     d = ImageDraw.Draw(banner)
     d.text((8, 4), f"{split}: {frame_id}", font=font, fill="white")
-    d.text((8, 25), "GT=blue | error=0 green | error=1 red | error=? yellow | table not scored", font=font, fill="white")
+    d.text((8, 25), "blue = human box | green = detector error=0 | red = error=1 | yellow = unknown | white = table", font=font, fill="white")
     d.text((8, 45), data["timestamp"], font=font, fill="white")
     output.parent.mkdir(parents=True, exist_ok=True)
     banner.save(output)
@@ -146,7 +176,8 @@ def serve(dataset, split, frame_id, port, open_browser):
                 if url.path == "/":
                     body, content_type = page, "text/html; charset=utf-8"
                 elif url.path == "/api/frames":
-                    body = json.dumps({"frames": dataset.frame_lists, "preferred_frames": dataset.preferred_frames, "initial_split": split, "initial_frame": frame_id}).encode()
+                    body = json.dumps({"frames": dataset.frame_lists, "preferred_frames": dataset.preferred_frames, "initial_split": split, "initial_frame": frame_id,
+                                       "worst": dataset.worst, "score_files": dataset.score_files}).encode()
                     content_type = "application/json"
                 elif url.path in ("/api/frame", "/image"):
                     s, f = params["split"][0], params["frame"][0]
@@ -194,11 +225,16 @@ def main():
     parser.add_argument("--no-human", action="store_true")
     parser.add_argument("--no-machine", action="store_true")
     parser.add_argument("--tables", action="store_true", help="Include table boxes in exported image")
+    parser.add_argument("--labels", action="store_true", help="Short labels in exported image")
+    parser.add_argument("--other", action="store_true", help="Also show unscored human classes (hair, uniform, phone…)")
+    parser.add_argument("--scores", type=Path, help="OOF score модели для train (id,score), например oof/redetect_strong_veto_veto.csv")
+    parser.add_argument("--test-scores", type=Path, help="Сабмит для test (id,score)")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--no-browser", action="store_true")
     args = parser.parse_args()
     try:
-        dataset = Dataset(args.data)
+        scores = {k: v for k, v in (("train", args.scores), ("test", args.test_scores)) if v}
+        dataset = Dataset(args.data, scores)
         frame_id = Path(args.frame).stem if args.frame else None
         if frame_id is None:
             # Start on an informative labeled frame rather than an empty night scene.
@@ -206,7 +242,8 @@ def main():
         if frame_id not in dataset.frames[args.split]:
             parser.error(f"Unknown frame in {args.split}: {frame_id}")
         if args.output:
-            export_image(dataset, args.split, frame_id, args.output, not args.no_human, not args.no_machine, args.tables)
+            export_image(dataset, args.split, frame_id, args.output, not args.no_human, not args.no_machine, args.tables,
+                         args.labels, args.other)
         else:
             serve(dataset, args.split, frame_id, args.port, not args.no_browser)
     except (OSError, ValueError, KeyError) as exc:
