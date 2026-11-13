@@ -1,0 +1,8 @@
+path: /Users/astra/Documents/projects/last_token/outputs/redetect/yolo/day_20261026
+train: images
+val: images
+names:
+  0: person
+  1: nude_hands
+  2: cup
+  3: tray

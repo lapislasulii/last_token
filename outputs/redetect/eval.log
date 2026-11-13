@@ -1,0 +1,13 @@
+                      method  AP 20261025  AP 20261026   mean
+             baseline 1-conf       0.8607       0.7648 0.8128
+                1 - iou_same       0.7132       0.6447 0.6789
+              1 - match_conf       0.7367       0.6436 0.6901
+   1 - iou_same*conf_at_best       0.6961       0.6455 0.6708
+rank-avg(base, 1-match_conf)       0.8773       0.7611 0.8192
+  rank-avg(base, 1-iou_same)       0.8424       0.7742 0.8083
+
+AP по классам (1 - match_conf vs baseline):
+  cup         n= 33  base=0.865  ours=0.857
+  nude_hands  n= 63  base=0.853  ours=0.865
+  person      n= 84  base=0.645  ours=0.405
+  tray        n= 18  base=0.813  ours=0.625
