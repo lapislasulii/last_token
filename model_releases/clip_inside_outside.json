@@ -1,0 +1,11 @@
+{
+  "sha256": "ff08a605754be2b7baa3e989800f8e926da5f2d74001c9c8c84c99545bba2347",
+  "metadata": {
+    "encoder": "openai/clip-vit-large-patch14",
+    "revision": "32bd64288804d66eefd0ccbe215aa642df71cc41",
+    "empty_patch_groups": 0,
+    "inside_outside": "Mean contextual patch tokens; padding excluded by patch centers. Not independent masked-image embeddings."
+  },
+  "public_ap": null,
+  "local_mean_ap": 0.8341573511233675
+}
