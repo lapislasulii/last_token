@@ -1,0 +1,46 @@
+[
+  {
+    "name": "redetect_strong_ens-base-s1-s2-st_strict_veto_veto",
+    "path": "submissions\\redetect_strong_ens-base-s1-s2-st_strict_veto_veto.csv",
+    "sha256": "a027294245f862bd4be822c6a8f9abbd17cbd6c130699af0b9f3db074357a84a",
+    "rows": 362,
+    "description": "last_token redetect_strong_ens-base-s1-s2-st_strict_veto_veto | sha256 a027294245f8 | YOLO11l seeds 0+1+2 plus strict self-training 40 epochs + expert veto",
+    "status": "complete",
+    "started_at_utc": "2026-11-13T22:50:01.956040+00:00",
+    "response": {
+      "ref": "58323021",
+      "message": "Successfully submitted to Case 1: Detector Error Discovery"
+    },
+    "submission": {
+      "ref": "58323021",
+      "date": "2026-11-13 22:50:03.067000",
+      "file_name": "redetect_strong_ens-base-s1-s2-st_strict_veto_veto.csv",
+      "description": "last_token redetect_strong_ens-base-s1-s2-st_strict_veto_veto | sha256 a027294245f8 | YOLO11l seeds 0+1+2 plus strict self-training 40 epochs + expert veto",
+      "status": "SubmissionStatus.COMPLETE",
+      "public_score": "0.89118",
+      "error_description": ""
+    }
+  },
+  {
+    "name": "redetect_strong_st_strict_veto_veto",
+    "path": "submissions\\redetect_strong_st_strict_veto_veto.csv",
+    "sha256": "e0aa2f22ab11ebcb0c5fc180f978b3f13b6d8985b47f6a550b51992bb7e8588a",
+    "rows": 362,
+    "description": "last_token redetect_strong_st_strict_veto_veto | sha256 e0aa2f22ab11 | strict self-training YOLO11l 40 epochs + expert veto",
+    "status": "complete",
+    "started_at_utc": "2026-11-13T22:50:08.885237+00:00",
+    "response": {
+      "ref": "58323024",
+      "message": "Successfully submitted to Case 1: Detector Error Discovery"
+    },
+    "submission": {
+      "ref": "58323024",
+      "date": "2026-11-13 22:50:10.027000",
+      "file_name": "redetect_strong_st_strict_veto_veto.csv",
+      "description": "last_token redetect_strong_st_strict_veto_veto | sha256 e0aa2f22ab11 | strict self-training YOLO11l 40 epochs + expert veto",
+      "status": "SubmissionStatus.COMPLETE",
+      "public_score": "0.80732",
+      "error_description": ""
+    }
+  }
+]
