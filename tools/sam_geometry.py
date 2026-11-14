@@ -24,14 +24,19 @@
 
 Веса (публичные): https://github.com/ultralytics/assets/releases/download/v8.4.0/sam2_t.pt  (положить в weights/)
 
+Веса для GPU: https://github.com/ultralytics/assets/releases/download/v8.4.0/sam2.1_b.pt
+              https://github.com/ultralytics/assets/releases/download/v8.4.0/sam2_b.pt
+
 Команды (из корня репозитория):
-  python tools/sam_geometry.py run    --split train --device cpu [--model weights/sam2_t.pt] [--rerun]
-      кэш outputs/sam_geometry/{split}_sam.csv
+  python tools/sam_geometry.py run    --split train --device 0 --model weights/sam2.1_b.pt [--rerun]
+      кэш outputs/sam_geometry/{split}_sam.csv (+ .json с именем модели); на CPU: --device cpu, sam2_t.pt
   python tools/sam_geometry.py review                       # контактный лист в outputs/sam_geometry/review/
-  python tools/sam_geometry.py diag   --members base         # ранний сигнал без вето: (1 − conf + D) / 2 против + G
-  python tools/sam_geometry.py eval   --members base s1 s2   # полная проверка против лидера; нужен outputs/expert_veto/
-  python tools/sam_geometry.py submit --members base s1 s2 --variant A
-      файл в submissions/ (существующий не перезаписывается; в Kaggle не отправляется)
+  python tools/sam_geometry.py eval   [--members ...]        # режим определяется сам и печатается первой строкой:
+      base   — нет outputs/expert_veto/*: опора (1 − conf + D) / 2 без вето и позы, OOF не пишется;
+      полный — есть кэш вето/позы: опора — лидер person_vote --skip-window --legs, OOF в oof/.
+      Участники по умолчанию — все из base s1 s2 base_flip s1_flip s2_flip, у которых есть дневные и test-файлы.
+  python tools/sam_geometry.py submit --variant A [--members ...]
+      только полный режим; файл в submissions/ (существующий не перезаписывается; в Kaggle не отправляется)
 """
 import argparse
 import json
@@ -56,6 +61,8 @@ CROP_FACTOR = {"nude_hands": 4.0, "cup": 4.0, "tray": 2.0}
 CROP_SIDE = 1024
 PERSON_DOWN, PERSON_UP = 0.60, 0.10
 G_IOU = 0.6
+ALL_MEMBERS = ["base", "s1", "s2", "base_flip", "s1_flip", "s2_flip"]   # состав лидера
+VETO_FILES = [f"{split}_{kind}.csv" for split in ("train", "test") for kind in ("pose", "features")]
 VARIANTS = {
     "A": (("person", "nude_hands", "cup", "tray"), "hard"),
     "B": (("person", "nude_hands"), "hard"),
@@ -161,11 +168,21 @@ def first_mask(masks, shape):
 
 def run(args):
     path = OUT / f"{args.split}_sam.csv"
+    meta = OUT / f"{args.split}_sam.json"
     if path.exists() and not args.rerun:
-        print(f"{path} уже есть; пересчёт только с --rerun")
+        cached = json.loads(meta.read_text()).get("model") if meta.exists() else "неизвестно"
+        print(f"{path} уже есть (модель {cached}); пересчёт только с --rerun")
+        if cached != args.model:
+            print(f"Внимание: запрошена модель {args.model}, а кэш посчитан на {cached}. Добавьте --rerun.")
         return
     from ultralytics import SAM
-    model = SAM(str(ROOT / args.model))
+    from ultralytics.utils.downloads import attempt_download_asset
+    weights = Path(args.model) if Path(args.model).is_absolute() else ROOT / args.model
+    if not weights.exists():  # публичные веса Ultralytics скачиваются по имени файла в указанную папку
+        weights.parent.mkdir(parents=True, exist_ok=True)
+        attempt_download_asset(str(weights))
+    print(f"SAM: {weights.name}, устройство {args.device}")
+    model = SAM(str(weights))
     rows = load_split(args.split)
     frames = rows.frame_id.unique()
     out, empty, start = [], [], time.time()
@@ -373,26 +390,46 @@ def test_firing():
     return test
 
 
-def diag(args):
-    """Ранний сигнал без вето и позы: (1 − conf + D) / 2 против того же с голосом SAM (A, B, C)."""
-    train, frames = train_rows(args.members)
-    df = with_sam(detector_votes(train, frames), "train")
-    print(f"Участники: {' '.join(args.members)}; вето и поза не учитываются (диагностика)")
-    reference = (1 - df.confidence + df.D) / 2
-    formulas = {"опора": reference}
+def available_members(requested, need_test=True):
+    """Участники, у которых есть оба дневных файла (и файл test): наборы train и test совпадают."""
+    pool = requested or ALL_MEMBERS
+    have = [m for m in pool
+            if all(R.pred_path(f"day_{d}", m).exists() for d in R.DAYS)
+            and (not need_test or R.pred_path("all", m).exists())]
+    return have, [m for m in pool if m not in have]
+
+
+def detect_mode(args):
+    """Режим eval: «полный» — есть все кэши вето/позы и хотя бы один участник; иначе «base» (без вето и позы)."""
+    members, missing = available_members(args.members)
+    veto_missing = [f for f in VETO_FILES if not (PV.VETO / f).exists()]
+    mode = "base" if veto_missing else "полный"
+    print(f"Режим: {mode}; участники: {' '.join(members) if members else '—'}")
+    if missing:
+        print(f"Нет дневных или test-предсказаний, участники пропущены: {' '.join(missing)}")
+    if veto_missing:
+        print(f"Нет кэша {PV.VETO.relative_to(ROOT)}/{{{','.join(veto_missing)}}}: опора без вето и позы")
+    if not members:
+        raise SystemExit("нет ни одного участника с дневными предсказаниями")
+    return mode, members
+
+
+def criterion(df, formulas, bottom):
+    """Критерий успеха, заданный до запуска; «заметно выше» во втором пункте оценивает человек."""
+    print("\nКритерий успеха")
+    days = {name: [average_precision_score(df.error[df.day == d], v[df.day == d]) for d in R.DAYS]
+            for name, v in formulas.items()}
+    ref = days["опора"]
     for name in VARIANTS:
-        formulas[name] = (1 - df.confidence + variant_d(df, name, df.votes, df.n_members)) / 2
-    print(ap_table(df, formulas).to_string(index=False))
-    bootstrap_lines(df, reference, {k: v for k, v in formulas.items() if k != "опора"})
-    print("\nКласс × день × ярус D × G: боксов / ошибок")
-    df["ярус"] = tier(df.D)
-    print(df.groupby(["class_name", "day", "ярус", "G"]).error.agg(боксов="size", ошибок="sum").to_string())
-    print("\nAP внутри класса (оба дня)")
-    print(class_ap(df, formulas).to_string(index=False))
-    print("\niou_sam: медиана по классу и метке")
-    print(df.groupby(["class_name", "error"]).iou_sam.median().round(3).unstack().to_string())
-    if (OUT / "test_sam.csv").exists():
-        test_firing()
+        both = all(days[name][k] >= ref[k] - 0.003 for k in range(len(R.DAYS)))
+        mean_gain = np.mean(days[name]) - np.mean(ref)
+        print(f"{name}: оба дня не хуже опоры (−0.003): {'да' if both else 'нет'}; "
+              f"среднее {mean_gain:+.4f} (нужно ≥ +0.005): {'да' if mean_gain >= 0.005 else 'нет'}")
+    low = df[bottom & df.class_name.isin(["person", "nude_hands"])]
+    for (cls, day), part in low.groupby(["class_name", "day"]):
+        rate = lambda g: (f"{int(part.error[part.G == g].sum())}/{int((part.G == g).sum())}"
+                          f" ({part.error[part.G == g].mean():.0%})" if (part.G == g).any() else "0 боксов")
+        print(f"нижний ярус {cls} {day}: ошибок при G=1 {rate(1)}, при G=0 {rate(0)}")
 
 
 def leader(df):
@@ -422,20 +459,42 @@ def name_for(members, variant):
 
 
 def evaluate(args):
-    train, frames = train_rows(args.members)
-    df = with_sam(PV.add_signals(train, "train", frames), "train")
-    formulas, d_leader, veto = scored(df)
-    print(f"Участники: {' '.join(args.members)}; опора — person_vote --skip-window --legs")
+    """Проверка на обоих днях train. Режим определяется сам (см. detect_mode).
+
+    base:   опора (1 − conf + D) / 2, варианты — та же формула с голосом SAM; OOF не пишется.
+    полный: опора — лидер person_vote --skip-window --legs, OOF вариантов пишутся в oof/.
+    """
+    mode, members = detect_mode(args)
+    train, frames = train_rows(members)
+    if mode == "base":
+        df = with_sam(detector_votes(train, frames), "train")
+        formulas = {"опора": (1 - df.confidence + df.D) / 2}
+        for name in VARIANTS:
+            formulas[name] = (1 - df.confidence + variant_d(df, name, df.votes, df.n_members)) / 2
+        df["ярус"], df["V"] = tier(df.D), 0.0
+    else:
+        df = with_sam(PV.add_signals(train, "train", frames), "train")
+        formulas, d_leader, veto = scored(df)
+        df["ярус"], df["V"] = tier(d_leader), veto
     print(ap_table(df, formulas).to_string(index=False))
     bootstrap_lines(df, formulas["опора"], {k: v for k, v in formulas.items() if k != "опора"})
-    df["ярус"], df["V"] = tier(d_leader), veto
-    print("\nКласс × день × ярус D' лидера × вето × G: боксов / ошибок")
-    print(df.groupby(["class_name", "day", "ярус", "V", "G"]).error.agg(боксов="size", ошибок="sum").to_string())
+    label = "D" if mode == "base" else "D' лидера × вето"
+    keys = ["class_name", "day", "ярус", "G"] if mode == "base" else ["class_name", "day", "ярус", "V", "G"]
+    print(f"\nКласс × день × ярус {label} × G: боксов / ошибок")
+    print(df.groupby(keys).error.agg(боксов="size", ошибок="sum").to_string())
     print("\nAP внутри класса (оба дня)")
     print(class_ap(df, formulas).to_string(index=False))
-    test_firing()
+    print("\niou_sam: медиана по классу и метке")
+    print(df.groupby(["class_name", "error"]).iou_sam.median().round(3).unstack().to_string())
+    criterion(df, formulas, (df.ярус == "0") & (df.V == 0))
+    if (OUT / "test_sam.csv").exists():
+        test_firing()
+    else:
+        print("\nНет outputs/sam_geometry/test_sam.csv: запустите run --split test для счёта срабатываний G")
+    if mode == "base":
+        return
     for name in VARIANTS:
-        path = ROOT / "oof" / name_for(args.members, name)
+        path = ROOT / "oof" / name_for(members, name)
         if path.exists():
             print(f"{path} уже есть, не перезаписываю")
         else:
@@ -444,6 +503,9 @@ def evaluate(args):
 
 
 def submit(args):
+    mode, args.members = detect_mode(args)
+    if mode != "полный":
+        raise SystemExit("submit собирается только в полном режиме: нужен кэш outputs/expert_veto/")
     test = R.load("test.csv", dtype={"id": str})  # как в person_vote.submit; столов в test нет
     frames = [test.merge(R.agreement_features(test, pd.read_csv(R.pred_path("all", m))), on="id")
               for m in args.members]
@@ -470,14 +532,18 @@ def submit(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("cmd", choices=["run", "review", "diag", "eval", "submit"])
+    parser.add_argument("cmd", choices=["run", "review", "eval", "submit"])
     parser.add_argument("--split", choices=["train", "test"], default="train")
-    parser.add_argument("--device", default="cpu", help="cpu или номер GPU, например 0")
-    parser.add_argument("--model", default="weights/sam2_t.pt", help="путь к весам SAM от корня репозитория")
-    parser.add_argument("--rerun", action="store_true", help="пересчитать кэш SAM")
+    parser.add_argument("--device", default="cpu", help="run: cpu или номер GPU, например 0")
+    parser.add_argument("--model", default="weights/sam2_t.pt",
+                        help="run: веса SAM от корня репозитория; на GPU — weights/sam2.1_b.pt или weights/sam2_b.pt "
+                             "(публичные веса Ultralytics скачиваются сами, если файла нет)")
+    parser.add_argument("--rerun", action="store_true", help="run: пересчитать кэш SAM (обязательно при смене модели)")
     parser.add_argument("--tag", default="strong", help="рабочая папка outputs/redetect_<tag>")
-    parser.add_argument("--members", nargs="+", default=["base"], help="участники ансамбля, как в redetect.py")
+    parser.add_argument("--members", nargs="+", default=None,
+                        help="участники ансамбля, как в redetect.py; по умолчанию — все доступные из "
+                             + " ".join(ALL_MEMBERS))
     parser.add_argument("--variant", choices=list(VARIANTS), default="A")
     a = parser.parse_args()
     R.WORK = ROOT / "outputs" / (f"redetect_{a.tag}" if a.tag else "redetect")
-    {"run": run, "review": review, "diag": diag, "eval": evaluate, "submit": submit}[a.cmd](a)
+    {"run": run, "review": review, "eval": evaluate, "submit": submit}[a.cmd](a)
