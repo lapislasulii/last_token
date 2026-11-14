@@ -148,7 +148,8 @@ def train(args):
             raise FileNotFoundError(f"{data_dir / 'data.yaml'}: сначала build" + (" и pseudo" if args.student else ""))
         model.train(data=str(data_dir / "data.yaml"), epochs=args.epochs, imgsz=args.imgsz,
                     batch=args.batch, device=args.device, project=str(WORK / "runs"),
-                    name=run_name(name, args.member), exist_ok=True, seed=args.seed, deterministic=True, val=False, patience=0, plots=False, flipud=0.0, verbose=False, workers=2)
+                    name=run_name(name, args.member), exist_ok=True, seed=args.seed, deterministic=True, val=False, patience=0, plots=False, flipud=0.0, verbose=False, workers=2,
+                    **({} if args.freeze is None else {"freeze": args.freeze}))  # без флага — прежнее поведение
 
 
 # ---------------------------------------------------------------- pseudo (self-training)
@@ -490,6 +491,8 @@ if __name__ == "__main__":
     ap.add_argument("--predict-batch", type=int, default=4)
     ap.add_argument("--device", default="mps")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--freeze", type=int, default=None,
+                    help="train: заморозить первые N слоёв (10 — весь backbone YOLO11); по умолчанию ничего не замораживается")
     ap.add_argument("--member", default="base", help="имя участника ансамбля для train/predict; base — без суффикса")
     ap.add_argument("--members", nargs="+", default=["base"],
                     help="участники для eval/submit; суффикс _flip — прогон на отражённых кадрах (base_flip, s1_flip)")
