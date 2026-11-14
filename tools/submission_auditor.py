@@ -97,9 +97,10 @@ class AuditResult:
     stats: dict
     identity: dict = field(default_factory=dict)
     queue: list[Finding] = field(default_factory=list)
+    path: str | None = None
 
     def to_dict(self):
-        return {'name': self.name, 'verdict': self.verdict, 'identity': self.identity, 'stats': self.stats,
+        return {'name': self.name, 'path': self.path, 'verdict': self.verdict, 'identity': self.identity, 'stats': self.stats,
                 'findings': [asdict(f) for f in self.findings], 'queue': [asdict(f) for f in self.queue]}
 
 
@@ -186,22 +187,28 @@ def add_detector_features(train: pd.DataFrame, test: pd.DataFrame, strong: Path 
     train['unmatched'] = (~train.matched.astype(bool)).astype(float)
     train['votes_missing'], train['n_members'] = train.unmatched, 1
 
+    from tie_break import discover_members
     boxes = test[['id', 'frame_id', 'class_name', 'x1', 'y1', 'x2', 'y2']]
-    members = {m: f for m, f in MEMBERS.items() if (strong / f).exists()}
-    if 'base' not in members:
+    found = discover_members(strong)
+    if 'base' not in found:
         raise FileNotFoundError(f'нет {strong / MEMBERS["base"]}')
-    feats = {m: boxes[['id']].merge(redetect.agreement_features(boxes, pd.read_csv(strong / f)), on='id', how='left')
-             for m, f in members.items()}
+    core = [m for m in MEMBERS if m in found]          # состав лидера: base+s1+s2
+    feats = {m: boxes[['id']].merge(redetect.agreement_features(boxes, pd.read_csv(path)), on='id', how='left')
+             .set_index('id').loc[test.id] for m, path in found.items()}
     base = feats['base']
-    test = test.merge(base[['id', 'iou_same', 'match_conf', 'iou_other', 'matched']], on='id', how='left')
+    test = test.merge(base.reset_index()[['id', 'iou_same', 'match_conf', 'iou_other', 'matched']], on='id', how='left')
     test['unmatched'] = (~test.matched.astype(bool)).astype(float)
-    test['n_members'] = len(feats)
-    test['votes_missing'] = np.sum([~f.set_index('id').loc[test.id, 'matched'].astype(bool).to_numpy() for f in feats.values()], axis=0)
+    test['n_members'] = len(core)
+    missing = {m: (~f.matched.astype(bool)).to_numpy() for m, f in feats.items()}
+    test['votes_missing'] = np.sum([missing[m] for m in core], axis=0)
     # Доли D для рецептов: один к одному и прежнее «любое совпадение» (iou_same < 0.6).
-    test['D_1to1'] = test.votes_missing / len(feats)
-    test['D_any'] = np.mean([(f.set_index('id').loc[test.id, 'iou_same'] < 0.6).to_numpy() for f in feats.values()], axis=0)
-    test['single_any'] = (base.set_index('id').loc[test.id, 'iou_same'] < 0.6).to_numpy().astype(float)
-    return train, test, sorted(feats)
+    test['D_1to1'] = test.votes_missing / len(core)
+    test['D_any'] = np.mean([(feats[m].iou_same < 0.6).to_numpy() for m in core], axis=0)
+    test['iou_core'] = np.mean([feats[m].iou_same.to_numpy() for m in core], axis=0)   # ключ разбивки ничьих
+    test['single_any'] = (base.iou_same < 0.6).to_numpy().astype(float)
+    if len(found) > len(core):                         # например, участники TTA *_flip или st_strict
+        test['D_all_1to1'] = np.mean(list(missing.values()), axis=0)
+    return train, test, core, sorted(found)
 
 
 def make_mini_model():
@@ -315,15 +322,23 @@ class SubmissionAuditor:
         self.data = data
         self.template = pd.read_csv(data / 'sample_submission.csv', dtype={'id': str})
         train, test = load_rows(data, 'train'), load_rows(data, 'test')
-        self.members, self.notes = [], []
+        self.members, self.all_members, self.notes = [], [], []
         try:
-            train, test, self.members = add_detector_features(train, test, strong)
+            train, test, self.members, self.all_members = add_detector_features(train, test, strong)
             self.features = DETECTOR_FEATURES
         except Exception as exc:
             self.features = TEMPORAL_FEATURES
             self.notes.append(f'признаков сильного детектора нет ({exc}); второе мнение — только временные признаки')
         self.train, self.test = train, test.set_index('id')
         self.validation = validate_mini_model(self.train, self.features)
+        if self.features is DETECTOR_FEATURES:
+            # Признаки детектора на train дали модели другого дня, а мини-модель учится на тех же двух fold:
+            # возможна косвенная утечка. Для честности рядом показываем вариант только на временных признаках.
+            clean = validate_mini_model(self.train, TEMPORAL_FEATURES)
+            self.validation['temporal_only'] = {d: v['ap_mini'] for d, v in clean['days'].items()}
+            self.validation['leak_note'] = ('признаки детектора на train получены моделями, обученными на другом дне, '
+                                            'а мини-модель учится на тех же двух fold — возможна косвенная утечка, '
+                                            'AP мини-модели может быть завышен')
         self.model = None
         try:
             if force_heuristics:
@@ -342,6 +357,7 @@ class SubmissionAuditor:
 
     def _recipes(self) -> dict[str, pd.Series]:
         t = self.test
+        self.recipe_names = dict(RECIPE_NAMES)
         recipes = {'baseline': 1 - t.confidence}
         if 'unmatched' in t:
             recipes['single_any'] = (1 - t.confidence + t.single_any) / 2
@@ -349,7 +365,22 @@ class SubmissionAuditor:
         if len(self.members) == 3:
             recipes['ens3_any'] = (1 - t.confidence + t.D_any) / 2
             recipes['ens3_1to1'] = (1 - t.confidence + t.D_1to1) / 2
+        if 'D_all_1to1' in t:
+            recipes['ens_all_1to1'] = (1 - t.confidence + t.D_all_1to1) / 2
+            self.recipe_names['ens_all_1to1'] = f'ансамбль {"+".join(self.all_members)}, один к одному'
         return recipes
+
+    def _match_recipe(self, score: pd.Series, ids, tol: float):
+        """(рецепт, вето?, id со сработавшим вето) или None. Сначала без вето: оно объясняет меньше."""
+        for name, recipe in self.recipes.items():
+            if np.abs(score - recipe[ids]).max() < tol:
+                return name, False, []
+        for name, recipe in self.recipes.items():
+            x = 2 * score - recipe[ids]
+            v = x.round()
+            if np.abs(x - v).max() < tol and v.isin([0, 1]).all() and v.sum() > 0:
+                return name, True, list(v[v == 1].index)
+        return None
 
     def weights(self) -> dict:
         if self.model is None:
@@ -366,21 +397,28 @@ class SubmissionAuditor:
         if len(ids) < len(self.test) or not len(ids) or clean[ids].nunique() < 2:
             return identity
         score = clean[ids]
-        # Сначала точные совпадения без вето: «одиночный детектор» по форме совпадает с «baseline + вето» при V = D,
-        # и более простое объяснение (без вето) должно побеждать.
-        for name, recipe in self.recipes.items():
-            if np.abs(score - recipe[ids]).max() < FORMULA_TOL:
-                identity.update(recipe=name, veto=False)
-                break
-        else:
-            for name, recipe in self.recipes.items():
-                x = 2 * score - recipe[ids]
-                v = x.round()
-                if np.abs(x - v).max() < FORMULA_TOL and v.isin([0, 1]).all() and v.sum() > 0:
-                    identity.update(recipe=name, veto=True, veto_ids=list(v[v == 1].index))
-                    break
+        # «Одиночный детектор» по форме совпадает с «baseline + вето» при V = D: более простое объяснение побеждает.
+        match = self._match_recipe(score, ids, FORMULA_TOL)
+        if match is None and 'iou_core' in self.test:
+            # После tools/tie_break.py: score = R·(1−eps) + eps·(1 − iou_core), eps ≤ 0.001. Сначала грубо находим R,
+            # затем проверяем, что остаток точно объясняется разбивкой с одним eps.
+            rough = self._match_recipe(score, ids, 3e-3)
+            if rough is not None:
+                name, veto, veto_ids = rough
+                r = self.recipes[name][ids]
+                r = (r + r.index.isin(veto_ids)) / 2 if veto else r
+                key = 1 - self.test.loc[ids, 'iou_core'].clip(0, 1)
+                diff, lever = score - r, key - r
+                eps = float((diff * lever).sum() / (lever * lever).sum())
+                if 0 < eps <= 2e-3 and np.abs(diff - eps * lever).max() < FORMULA_TOL:
+                    match = rough
+                    identity.update(tie_break=True, tie_break_eps=eps)
+        if match is not None:
+            identity.update(recipe=match[0], veto=match[1])
+            if match[1]:
+                identity['veto_ids'] = match[2]
         if 'recipe' in identity:
-            public = KAGGLE.get((identity['recipe'], identity['veto']))
+            public = KAGGLE.get((identity['recipe'], identity['veto'])) if not identity.get('tie_break') else None
             identity['recipe_public'] = public
             identity.setdefault('kaggle_public', public)
         else:
@@ -395,14 +433,21 @@ class SubmissionAuditor:
             out.append(Finding('info', 'known_file', f'SHA256 совпадает с отправленным файлом: '
                                                      f'{identity["known_submission"]}, Public {identity["kaggle_public"]}'))
         if 'recipe' in identity:
-            name = RECIPE_NAMES[identity['recipe']] + (' + вето экспертов' if identity['veto'] else '')
+            name = self.recipe_names[identity['recipe']] + (' + вето экспертов' if identity['veto'] else '')
             extra = f', вето сработало на {len(identity["veto_ids"])} боксах' if identity['veto'] else ''
-            public = identity.get('recipe_public')
-            known = f'; на Kaggle такой рецепт дал Public {public}' if public else '; такой рецепт на Kaggle не отправлялся'
-            out.append(Finding('info', 'recipe', f'файл точно воспроизводится формулой: {name}{extra}{known}'))
+            if identity.get('tie_break'):
+                base_public = KAGGLE.get((identity['recipe'], identity['veto']))
+                known = (f'; без разбивки этот рецепт дал Public {base_public}, с разбивкой — на Kaggle не отправлялся'
+                         if base_public else '; на Kaggle не отправлялся')
+                out.append(Finding('info', 'recipe', f'файл = {name}{extra} + разбивка ничьих tools/tie_break.py '
+                                                     f'(eps {identity["tie_break_eps"]:.2g}){known}'))
+            else:
+                public = identity.get('recipe_public')
+                known = f'; на Kaggle такой рецепт дал Public {public}' if public else '; такой рецепт на Kaggle не отправлялся'
+                out.append(Finding('info', 'recipe', f'файл точно воспроизводится формулой: {name}{extra}{known}'))
         elif 'nearest_recipe' in identity:
             out.append(Finding('info', 'recipe', f'формулой не воспроизводится; ближе всего к рецепту '
-                                                 f'«{RECIPE_NAMES[identity["nearest_recipe"]]}» (Spearman {identity["nearest_corr"]:+.3f})'))
+                                                 f'«{self.recipe_names[identity["nearest_recipe"]]}» (Spearman {identity["nearest_corr"]:+.3f})'))
         public = identity.get('kaggle_public')
         if public is not None and public < BEST_PUBLIC:
             out.append(Finding('warning', 'not_best', f'у этого файла Public {public}, а лучший известный результат '
@@ -410,11 +455,19 @@ class SubmissionAuditor:
         return out
 
     # ------------------------------------------------------------ аудит
-    def audit(self, sub: pd.DataFrame, name: str, top: int = 8, digest: str | None = None, queue: int = 15) -> AuditResult:
+    def audit(self, sub: pd.DataFrame, name: str, top: int = 8, digest: str | None = None, queue: int = 15,
+              path: str | None = None) -> AuditResult:
+        from tie_break import tie_stats
         findings, clean = check_format(sub, self.template.id)
         stats = {'rows': int(len(sub)), 'valid_rows': int(len(clean)), 'mode': self.mode}
         identity = self.identify(clean, digest)
         findings += self._identity_findings(identity)
+        if len(clean) > 20 and clean.nunique() > 1:
+            ties = stats['ties'] = tie_stats(clean)
+            if ties['in_ties'] > 0.5 * ties['rows']:
+                findings.append(Finding('info', 'ties', f'{ties["in_ties"]} из {ties["rows"]} боксов стоят в {ties["groups"]} группах '
+                                                        f'с одинаковым баллом (крупнейшая {ties["largest"]}): порядок внутри групп для AP '
+                                                        'случаен. Разбить без изменения порядка групп: python tools/tie_break.py <файл>'))
         rows = self.test.loc[self.test.index.intersection(clean.index)].copy()
         veto = set(identity.get('veto_ids', []))
         rows['reasons'] = [list(r) + (['вето экспертов: публичные COCO/поза-модели не подтвердили объект'] if i in veto else [])
@@ -428,10 +481,10 @@ class SubmissionAuditor:
         verdict = 'error' if 'error' in levels else 'warning' if 'warning' in levels else 'ok'
         order = {'error': 0, 'warning': 1, 'info': 2}
         findings.sort(key=lambda f: (order[f.level], f.main_rank is not None, f.rule))
-        return AuditResult(name, verdict, findings, stats, identity, result_queue)
+        return AuditResult(name, verdict, findings, stats, identity, result_queue, path)
 
     def audit_file(self, path: Path, top: int = 8, queue: int = 15) -> AuditResult:
-        return self.audit(read_submission(path), path.stem, top, sha256(path), queue)
+        return self.audit(read_submission(path), path.stem, top, sha256(path), queue, str(path))
 
     def _second_opinion(self, rows: pd.DataFrame, stats: dict, top: int, veto: set) -> list[Finding]:
         findings = []
@@ -686,17 +739,19 @@ def format_html(results: list[AuditResult], auditor: SubmissionAuditor, out_dir:
              'и очередь оператора с объяснениями. Код основной системы не менялся.</p>']
     parts += [f'<p class="muted">⚠ {esc(n)}</p>' for n in auditor.notes]
     parts.append('<h2>Сводка</h2><div class="scroll"><table><tr><th>Сабмит</th><th>Вердикт</th><th>Что это за файл</th>'
-                 '<th>Public</th><th>Spearman с мини-моделью</th><th>Пропущено / лишних</th></tr>')
+                 '<th>Public</th><th>Боксов в ничьих</th><th>Spearman с мини-моделью</th><th>Пропущено / лишних</th></tr>')
     for r in results:
         s, ident = r.stats, r.identity
-        what = ident.get('known_submission') or (RECIPE_NAMES[ident['recipe']] + (' + вето' if ident['veto'] else '')
+        what = ident.get('known_submission') or (auditor.recipe_names[ident['recipe']] + (' + вето' if ident['veto'] else '')
+                                                 + (' + разбивка ничьих' if ident.get('tie_break') else '')
                                                  if 'recipe' in ident else 'не опознан')
         public = ident.get('kaggle_public')
+        ties = f"{s['ties']['in_ties']} / {s['ties']['rows']}" if 'ties' in s else '—'
         corr = f"{s['spearman_vs_mini']:+.2f}" if 'spearman_vs_mini' in s else '—'
         dis = f"{s['missed_by_main']} / {s['overflagged_by_main']}" if 'missed_by_main' in s else '—'
         parts.append(f'<tr><td><a href="#{esc(r.name)}">{esc(r.name)}</a></td>'
                      f'<td><span class="badge {r.verdict}">{r.verdict}</span></td><td>{esc(what)}</td>'
-                     f'<td>{public if public else "—"}</td><td>{corr}</td><td>{dis}</td></tr>')
+                     f'<td>{public if public else "—"}</td><td>{ties}</td><td>{corr}</td><td>{dis}</td></tr>')
     parts.append('</table></div>')
 
     parts.append('<h2>Можно ли доверять второму мнению</h2>'
@@ -711,7 +766,12 @@ def format_html(results: list[AuditResult], auditor: SubmissionAuditor, out_dir:
     if 'ap_person_mini' in v:
         parts.append(f'<div class="card"><span class="muted">AP на людях</span><b>{v["ap_person_mini"]:.3f}</b>'
                      f'<span class="muted">baseline {v["ap_person_baseline"]:.3f}</span></div>')
-    parts.append('</div><details><summary>Эвристики и веса мини-модели</summary>'
+    parts.append('</div>')
+    if 'leak_note' in v:
+        clean = ', '.join(f'{d}: {x:.3f}' for d, x in v['temporal_only'].items())
+        parts.append(f'<p class="muted">⚠ Осторожно: {esc(v["leak_note"])}. Без признаков детектора (только временные) '
+                     f'мини-модель даёт {clean}. Разбивка ничьих в tools/tie_break.py мини-модель не использует.</p>')
+    parts.append('<details><summary>Эвристики и веса мини-модели</summary>'
                  '<div class="scroll"><table><tr><th>Эвристика</th><th>Сработала на train</th><th>Из них ошибок</th></tr>')
     for rule, d in v.get('rules', {}).items():
         parts.append(f'<tr><td>{esc(rule)}</td><td>{d["fired"]}</td><td>{d["error_rate"]:.0%}</td></tr>')
@@ -745,10 +805,10 @@ def format_html(results: list[AuditResult], auditor: SubmissionAuditor, out_dir:
         cards = [f for f in r.findings if f.main_rank is not None]
         if cards:
             parts.append('<h3>Расхождения с мини-моделью</h3>')
-            parts += [_detection_card(f, auditor, out_dir) for f in cards]
+            parts += [_detection_card(f, auditor, out_dir, r.path) for f in cards]
         if r.queue:
             parts.append(f'<details><summary>Очередь оператора: первые {len(r.queue)} боксов с причинами</summary>')
-            parts += [_detection_card(f, auditor, out_dir) for f in r.queue]
+            parts += [_detection_card(f, auditor, out_dir, r.path) for f in r.queue]
             parts.append('</details>')
 
     if comparisons:
@@ -773,8 +833,10 @@ def format_html(results: list[AuditResult], auditor: SubmissionAuditor, out_dir:
     return '\n'.join(parts)
 
 
-def _detection_card(f: Finding, auditor: SubmissionAuditor, out_dir: Path) -> str:
+def _detection_card(f: Finding, auditor: SubmissionAuditor, out_dir: Path, path: str | None = None) -> str:
     esc = html.escape
+    scores = Path(path).as_posix() if path else '<сабмит.csv>'
+    viewer = f'python tools/view_frame.py --split test --frame {f.frame_id} --test-scores {scores}'
     b = auditor.box(f.id)
     image = auditor.data / b['image_path']
     try:
@@ -794,7 +856,8 @@ def _detection_card(f: Finding, auditor: SubmissionAuditor, out_dir: Path) -> st
              f'Место в очереди: система <b>{f.main_rank}</b>, мини-модель <b>{f.mini_rank}</b>')
     return (f'<div class="det">{svg}<div><span class="badge info">{f.rule}</span> <b>{title}</b>'
             f'<div class="muted"><code>id={esc(f.id)}</code> · {esc(f.class_name)} · <code>{esc(f.frame_id)}</code></div>'
-            f'<div>{ranks}</div><div>{esc(f.message)}</div><ul>{reasons}</ul></div></div>')
+            f'<div>{ranks}</div><div>{esc(f.message)}</div><ul>{reasons}</ul>'
+            f'<div class="muted">Открыть в просмотрщике: <code>{esc(viewer)}</code></div></div></div>')
 
 
 def save_reports(results: list[AuditResult], auditor: SubmissionAuditor, out_dir: Path = OUTPUT_DIR,

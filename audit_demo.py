@@ -36,6 +36,11 @@ def demo_cases(auditor: SubmissionAuditor):
         sim = ((auditor.test.loc[ids, 'confidence'] < 0.6) & (auditor.test.loc[ids, 'votes_missing'] > 0)).to_numpy()
         yield 'demo_leader_sim_veto', 'имитация лидера: ансамбль один к одному + вето (вето смоделировано правилом)', \
             frame((good + sim) / 2)
+        from tie_break import tie_break
+        leader = pd.Series((good + sim) / 2, index=ids.values)
+        broken, _ = tie_break(leader, 1 - auditor.test.loc[ids, 'iou_core'].clip(0, 1).set_axis(ids.values))
+        yield 'demo_leader_tiebreak', 'тот же лидер после tools/tie_break.py (ничьи разбиты по iou_same ансамбля)', \
+            frame(broken.loc[ids].to_numpy())
         yield 'demo_old_matching', 'не тот файл: ансамбль со старым сопоставлением «любое совпадение» + то же вето', \
             frame((recipes['ens3_any'] + sim) / 2)
         yield 'demo_single_detector', 'не тот файл: одиночный детектор без вето', frame(recipes['single_1to1'])
@@ -84,7 +89,8 @@ def main() -> int:
         print(format_text(result, limit=2, queue=3 if name == 'demo_leader_sim_veto' else 0))
 
     frames = {name: frame for name, _, frame, _ in cases}
-    pairs = [('demo_leader_sim_veto', 'demo_old_matching'), ('demo_single_detector', 'demo_leader_no_veto')]
+    pairs = [('demo_leader_tiebreak', 'demo_leader_sim_veto'), ('demo_leader_sim_veto', 'demo_old_matching'),
+             ('demo_single_detector', 'demo_leader_no_veto')]
     comparisons = [auditor.compare(frames[a], frames[b], a, b, top=4) for a, b in pairs if a in frames and b in frames]
     for c in comparisons:
         print()
@@ -93,7 +99,7 @@ def main() -> int:
     print('\n=== Итог ===')
     for r in results:
         ident = r.identity
-        what = ident.get('recipe', '') + ('+вето' if ident.get('veto') else '')
+        what = ident.get('recipe', '') + ('+вето' if ident.get('veto') else '') + ('+разбивка' if ident.get('tie_break') else '')
         print(f'  {r.verdict.upper():8} {r.name:24} {what:18} {"Public " + str(ident["kaggle_public"]) if ident.get("kaggle_public") else ""}')
     path = save_reports(results, auditor, OUTPUT_DIR, 'audit_demo', comparisons=comparisons)
     print(f'\nHTML-отчёт для жюри: {path}')

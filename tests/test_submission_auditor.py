@@ -15,8 +15,8 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tools'))
-from submission_auditor import (DEFAULT_DATA, STRONG, SubmissionAuditor, check_format,  # noqa: E402
-                                known_by_sha, sha256)
+from submission_auditor import (DEFAULT_DATA, DETECTOR_FEATURES, STRONG, SubmissionAuditor,  # noqa: E402
+                                check_format, known_by_sha, sha256)
 
 IDS = [f'id{i:03d}' for i in range(50)]
 
@@ -108,6 +108,27 @@ class SecondOpinion(unittest.TestCase):
         comparison = self.auditor.compare(frame((self.good + self.veto) / 2), frame(old), 'new', 'old')
         self.assertEqual(comparison.stats['changed_rows'], 8)          # как в reports/one_to_one.md
         self.assertIn('почти одинаковые', ' '.join(comparison.notes))
+
+    @unittest.skipUnless((STRONG / 'pred_all_s2.csv').exists(), 'нет предсказаний ансамбля')
+    def test_tie_broken_leader_is_identified_and_ties_reported(self):
+        from tie_break import tie_break
+        leader = pd.Series((self.good + self.veto) / 2, index=self.ids.values)
+        plain = self.audit(leader.to_numpy())
+        self.assertIn('ties', rules(plain))
+        self.assertGreater(plain.stats['ties']['in_ties'], 300)
+        broken, eps = tie_break(leader, 1 - self.auditor.test.loc[self.ids, 'iou_core'].clip(0, 1).set_axis(self.ids.values))
+        result = self.audit(broken.loc[self.ids].to_numpy())
+        identity = result.identity
+        self.assertEqual((identity['recipe'], identity['veto'], identity.get('tie_break')), ('ens3_1to1', True, True))
+        self.assertAlmostEqual(identity['tie_break_eps'], eps, places=8)
+        self.assertNotIn('ties', rules(result))
+        self.assertEqual(result.verdict, 'ok')
+
+    def test_leak_note_and_clean_baseline_are_reported(self):
+        if self.auditor.features is not DETECTOR_FEATURES:
+            self.skipTest('без признаков детектора')
+        self.assertIn('leak_note', self.auditor.validation)
+        self.assertEqual(len(self.auditor.validation['temporal_only']), 2)
 
     def test_broken_queues_are_flagged(self):
         self.assertIn('same_as_baseline', rules(self.audit(self.recipes['baseline'])))
