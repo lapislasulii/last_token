@@ -12,8 +12,14 @@ E3 из tools/weak_spots.py: у person голос одного детектор�
                     (допуск 1e-9). Затем E3 для людей по всем шести участникам; P, V, L — из разложения
                     файла лидера с позой. Выход: submissions/weak_spots_e3_exact_on_flip_pose.csv.
 
+  eval-e3 --members ...
+                    E3 на train для набора участников: каждый — R.oof_features (не видел день бокса), голос
+                    для людей как в E3, у остальных классов обычный; D — среднее голосов; P, V, L — PV.add_signals
+                    с тем же списком. Ворота: опора без E3 совпадает с person_vote.py eval --skip-window --legs.
+
 Команды (из корня репозитория):
-  python tools/weak_spots_e3.py sensitivity
+  python tools/weak_spots_e3.py sensitivity                # то же, что сетка из eval-e3 --members base
+  python tools/weak_spots_e3.py eval-e3 --members base s1 s2 base_flip s1_flip s2_flip
   python tools/weak_spots_e3.py build-e3 --mode exact      # в Kaggle не отправляется
 Файлы pred_all*_flip.csv берутся из origin/main через git show (см. reports/weak_spots.md), в git ветки не входят.
 """
@@ -24,6 +30,7 @@ import numpy as np
 import pandas as pd
 from scipy.stats import spearmanr
 
+import person_vote as PV
 import redetect as R
 import weak_spots as W
 
@@ -42,21 +49,42 @@ def grid_vote(iou_same, matched, cls, threshold, weight):
     return np.where(np.asarray(cls) == "person", person, (~matched).astype(float))
 
 
-def sensitivity(args):
-    df = W.train_table()
-    base = dict(conf_term=1 - df.confidence, n_members=df.n_members, P=df.P, veto=df.veto, L=df.L,
-                person_out=df.person_out)
-    reference = pd.Series(W.formula(votes=df.votes, **base), index=df.index)
+def member_votes(matched, iou_same, cls, threshold=W.LOW_IOU, weight=W.MID_VOTE):
+    """Сумма голосов участников (строки — участники). У person — двухуровневый голос, у остальных — обычный."""
+    matched, iou_same = np.atleast_2d(matched), np.atleast_2d(iou_same)
+    return sum(grid_vote(iou_same[k], matched[k], cls, threshold, weight) for k in range(len(matched)))
+
+
+def train_members(members):
+    """Боксы train с P, V, L по тому же списку участников (PV.add_signals) и признаки каждого участника.
+    Каждый участник взят из R.oof_features: модель не видела день бокса."""
+    train = R.load("train.csv", dtype={"id": str})
+    train = train[train.class_name != "table"].copy()
+    train["day"] = train.frame_id.map(R.frame_day("train"))
+    frames = [R.oof_features(train, m) for m in members]
+    df = PV.add_signals(train, "train", frames)
+    feats = [f.set_index("id").reindex(df.id) for f in frames]
+    matched = np.stack([f.matched.to_numpy(dtype=bool) for f in feats])
+    iou_same = np.stack([f.iou_same.to_numpy(dtype=float) for f in feats])
+    df["window"] = W.in_window(df.x1, df.x2)
+    df["person_out"] = (df.class_name == "person") & ~df.window
+    return df, matched, iou_same
+
+
+def leader_score(df, votes):
+    return pd.Series(W.formula(1 - df.confidence, votes, df.n_members, df.P, df.veto, df.L, df.person_out),
+                     index=df.index)
+
+
+def grid_table(df, matched, iou_same, reference):
+    """Сетка порог × вес: AP по дням и прирост к опоре (диагностика; кандидат — 0.3 / 0.25)."""
     ref_days = W.day_ap(df, reference)
     person = (df.class_name == "person").to_numpy()
     ref_person = W.day_ap(df, reference, person)
-    print("Участник base, локальный кэш вето; опора — person_vote --skip-window --legs "
-          f"({ref_days[0]:.4f} / {ref_days[1]:.4f}). Диагностика: кандидат остаётся 0.3 / 0.25.")
     rows = []
     for threshold in THRESHOLDS:
         for weight in WEIGHTS:
-            score = pd.Series(W.formula(votes=grid_vote(df.iou_same, df.matched, df.class_name, threshold, weight),
-                                        **base), index=df.index)
+            score = leader_score(df, member_votes(matched, iou_same, df.class_name, threshold, weight))
             days, pdays = W.day_ap(df, score), W.day_ap(df, score, person)
             rows.append({"порог": threshold, "вес": weight,
                          R.DAYS[0]: round(days[0], 4), R.DAYS[1]: round(days[1], 4),
@@ -66,7 +94,48 @@ def sensitivity(args):
                          f"прирост {R.DAYS[1]}": round(days[1] - ref_days[1], 4),
                          "люди: прирост по дням": f"{pdays[0] - ref_person[0]:+.4f} / {pdays[1] - ref_person[1]:+.4f}",
                          "E3": "<-" if (threshold, weight) == (0.3, 0.25) else ""})
-    print(pd.DataFrame(rows).to_string(index=False))
+    return pd.DataFrame(rows)
+
+
+def setup(members):
+    """Таблица, опора и ворота: опора без E3 обязана совпасть с person_vote eval --skip-window --legs."""
+    df, matched, iou_same = train_members(members)
+    assert np.array_equal((~matched).sum(axis=0), df.votes.to_numpy()), "голоса участников разошлись с add_signals"
+    reference = leader_score(df, (~matched).sum(axis=0))
+    _, check = PV.scores(df, legs=True, skip_window=True)
+    assert np.allclose(reference.to_numpy(), check.to_numpy(), atol=1e-12), \
+        "опора разошлась с person_vote.py eval --skip-window --legs"
+    return df, matched, iou_same, reference
+
+
+def sensitivity(args):
+    df, matched, iou_same, reference = setup(["base"])
+    ref_days = W.day_ap(df, reference)
+    print("Участник base, локальный кэш вето; опора — person_vote --skip-window --legs "
+          f"({ref_days[0]:.4f} / {ref_days[1]:.4f}). Диагностика: кандидат остаётся 0.3 / 0.25.")
+    print(grid_table(df, matched, iou_same, reference).to_string(index=False))
+
+
+def eval_e3(args):
+    """E3 на train для любого набора участников с дневными предсказаниями."""
+    members = args.members
+    missing = [m for m in members if not all(R.pred_path(f"day_{d}", m).exists() for d in R.DAYS)]
+    if missing:
+        raise SystemExit(f"нет дневных предсказаний для: {' '.join(missing)}")
+    df, matched, iou_same, reference = setup(members)
+    print(f"Участники: {' '.join(members)}; опора — person_vote --skip-window --legs "
+          f"(ворота: совпадение с person_vote.scores пройдено)")
+    scores = {"опора": reference, "E3": leader_score(df, member_votes(matched, iou_same, df.class_name))}
+    print("\nAP по дням")
+    print(pd.DataFrame([dict(формула=k, **{d: round(v, 4) for d, v in zip(R.DAYS, W.day_ap(df, s))},
+                             среднее=round(float(np.mean(W.day_ap(df, s))), 4)) for k, s in scores.items()])
+          .to_string(index=False))
+    print("\nBootstrap по кадрам (3000 повторов), исключение по одному кадру, критерий")
+    W.check(df, "E3", scores["E3"], reference)
+    print("\nAP внутри person")
+    print(W.person_ap(df, scores).to_string(index=False))
+    print("\nСетка чувствительности порог × вес (диагностика; кандидат 0.3 / 0.25)")
+    print(grid_table(df, matched, iou_same, reference).to_string(index=False))
 
 
 def member_table(test, member):
@@ -124,8 +193,10 @@ def build_e3(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("cmd", choices=["sensitivity", "build-e3"])
+    parser.add_argument("cmd", choices=["sensitivity", "eval-e3", "build-e3"])
     parser.add_argument("--mode", choices=["exact"], default="exact", help="build-e3: только точный режим")
+    parser.add_argument("--members", nargs="+", default=["base"],
+                        help="eval-e3: участники с дневными предсказаниями, например base s1 s2 base_flip s1_flip s2_flip")
     a = parser.parse_args()
     R.WORK = ROOT / "outputs" / "redetect_strong"
-    {"sensitivity": sensitivity, "build-e3": build_e3}[a.cmd](a)
+    {"sensitivity": sensitivity, "eval-e3": eval_e3, "build-e3": build_e3}[a.cmd](a)
